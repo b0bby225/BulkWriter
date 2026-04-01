@@ -55,6 +55,7 @@ typedef enum {
     Mod_Auto = 0,    /** Auto-detect (slowest — cycles ASK+PSK) */
     Mod_ASK,          /** ASK only (HID, EM4100, most common) */
     Mod_PSK,          /** PSK only (Indala, AWID, etc.) */
+    Mod_NFC,          /** NFC 13.56MHz mode */
     Mod_COUNT
 } ModSelect;
 

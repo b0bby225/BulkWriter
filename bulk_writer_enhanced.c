@@ -59,19 +59,12 @@ typedef enum {
 #define CARD_NUM_DEFAULT      0
 #define CARD_NUM_MODE_DEFAULT CardNumMode_Preserve
 
-/** Reader type selection */
+/** Modulation/Reader selection */
 typedef enum {
-    ReaderType_LFRFID = 0,    /** 125kHz Low Frequency RFID */
-    ReaderType_NFC,           /** 13.56MHz NFC/HF */
-    ReaderType_Auto,          /** Auto-detect (tries all) */
-    ReaderType_COUNT
-} ReaderType;
-
-/** Modulation selection for LFRFID */
-typedef enum {
-    Mod_Auto = 0,    /** Auto-detect (slowest — cycles ASK+PSK) */
-    Mod_ASK,         /** ASK only (HID, EM4100, most common) */
-    Mod_PSK,         /** PSK only (Indala, AWID, etc.) */
+    Mod_Auto = 0,    /** Auto-detect all protocols (LF + NFC) */
+    Mod_ASK,         /** LF ASK only (HID, EM4100, most common) */
+    Mod_PSK,         /** LF PSK only (Indala, AWID, etc.) */
+    Mod_NFC,         /** NFC 13.56MHz only (NTAG, Mifare) */
     Mod_COUNT
 } ModSelect;
 
@@ -123,15 +116,14 @@ typedef struct {
     uint8_t target_fc;               /** Target facility code (0-255) */
     uint32_t target_cn;              /** Target card number (for Fixed mode) */
     CardNumMode card_num_mode;       /** How to handle card numbers */
-    ReaderType reader_type;          /** Which reader to use */
-    ModSelect mod_select;            /** LFRFID modulation preference */
+    ModSelect mod_select;            /** Modulation/reader type selection */
 
     /* Config screen cursor */
     uint8_t config_cursor;           /** Which config field is selected */
 
     /* Reference scan state */
     bool ref_scanned;                /** True if a reference card was scanned */
-    ReaderType ref_reader_type;      /** Which reader type was used for ref */
+    ModSelect ref_mod_type;          /** Which modulation/reader was used for ref */
     ProtocolId ref_lfrfid_protocol;  /** LFRFID protocol from reference */
     NfcProtocolId ref_nfc_protocol;  /** NFC protocol from reference */
     char ref_proto_name[32];         /** Human-readable protocol name from reference */
@@ -140,7 +132,7 @@ typedef struct {
 
     /* Runtime state */
     bool running;                    /** Main processing loop active */
-    ReaderType active_reader;        /** Currently active reader type */
+    ModSelect active_mod;            /** Currently active modulation/reader */
     ProtocolId last_lfrfid_protocol; /** Last LFRFID protocol detected */
     NfcProtocolId last_nfc_protocol; /** Last NFC protocol detected */
 
@@ -414,7 +406,7 @@ static void nfc_read_callback(NfcProtocolId protocol, void* context) {
     
     // Copy protocol data
     app->last_nfc_protocol = protocol;
-    app->active_reader = ReaderType_NFC;
+    app->active_mod = Mod_NFC;
     
     // Get NFC data (implementation depends on NFC API structure)
     // This is a simplified example - actual implementation would vary
@@ -438,20 +430,18 @@ static void nfc_read_callback(NfcProtocolId protocol, void* context) {
 static void app_draw_config(Canvas* canvas, BulkWriterApp* app) {
     canvas_clear(canvas);
     canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str(canvas, 2, 10, "Bulk Writer Setup");
+    canvas_draw_str(canvas, 2, 10, "Bulk Writer Enhanced");
     
     canvas_set_font(canvas, FontSecondary);
     canvas_draw_line(canvas, 0, 13, 128, 13);
     
     // Field labels and values
-    char fc_str[16], cn_str[32], reader_str[16], mod_str[16];
+    char fc_str[16], cn_str[32], mod_str[20];
     const char* cn_modes[] = {"Preserve", "Sequential", "Fixed"};
-    const char* reader_types[] = {"LF (125k)", "NFC (13.56M)", "Auto"};
-    const char* mod_names[] = {"Auto", "ASK", "PSK"};
+    const char* mod_names[] = {"Auto (LF+NFC)", "ASK (125k)", "PSK (125k)", "NFC (13.56M)"};
     
     snprintf(fc_str, sizeof(fc_str), "FC: %u", app->target_fc);
     snprintf(cn_str, sizeof(cn_str), "CN: %s", cn_modes[app->card_num_mode]);
-    snprintf(reader_str, sizeof(reader_str), "%s", reader_types[app->reader_type]);
     snprintf(mod_str, sizeof(mod_str), "%s", mod_names[app->mod_select]);
     
     // Draw fields with cursor highlighting
@@ -470,25 +460,15 @@ static void app_draw_config(Canvas* canvas, BulkWriterApp* app) {
     canvas_draw_str(canvas, 8, y_pos, cn_str);
     y_pos += 12;
     
-    // Reader type field
+    // Modulation/Reader field (unified)
     if(app->config_cursor == 2) canvas_draw_box(canvas, 0, y_pos - 9, 128, 11);
     canvas_draw_str(canvas, 2, y_pos, app->config_cursor == 2 ? ">" : " ");
-    canvas_draw_str(canvas, 8, y_pos, "Reader: ");
-    canvas_draw_str(canvas, 50, y_pos, reader_str);
-    y_pos += 12;
-    
-    // Modulation field (only for LFRFID)
-    if(app->reader_type == ReaderType_LFRFID || app->reader_type == ReaderType_Auto) {
-        if(app->config_cursor == 3) canvas_draw_box(canvas, 0, y_pos - 9, 128, 11);
-        canvas_draw_str(canvas, 2, y_pos, app->config_cursor == 3 ? ">" : " ");
-        canvas_draw_str(canvas, 8, y_pos, "Mod: ");
-        canvas_draw_str(canvas, 35, y_pos, mod_str);
-        canvas_draw_str(canvas, 90, y_pos, "Scan >");
-        y_pos += 12;
-    }
+    canvas_draw_str(canvas, 8, y_pos, "Mod: ");
+    canvas_draw_str(canvas, 35, y_pos, mod_str);
+    canvas_draw_str(canvas, 90, y_pos, "Scan >");
     
     // Instructions
-    canvas_draw_str(canvas, 35, 60, "[ Start ]");
+    canvas_draw_str_aligned(canvas, 64, 60, AlignCenter, AlignBottom, "[ Start ]");
 }
 
 static void app_draw_ref_scan(Canvas* canvas, BulkWriterApp* app) {
@@ -499,10 +479,11 @@ static void app_draw_ref_scan(Canvas* canvas, BulkWriterApp* app) {
     canvas_set_font(canvas, FontSecondary);
     
     const char* reader_msg = "";
-    switch(app->reader_type) {
-        case ReaderType_LFRFID: reader_msg = "Place LF card on reader"; break;
-        case ReaderType_NFC: reader_msg = "Place NFC card on reader"; break;
-        case ReaderType_Auto: reader_msg = "Place any card on reader"; break;
+    switch(app->mod_select) {
+        case Mod_ASK:
+        case Mod_PSK: reader_msg = "Place LF card on reader"; break;
+        case Mod_NFC: reader_msg = "Place NFC card on reader"; break;
+        case Mod_Auto: reader_msg = "Place any card on reader"; break;
     }
     
     canvas_draw_str_aligned(canvas, 64, 32, AlignCenter, AlignCenter, reader_msg);
@@ -518,16 +499,16 @@ static void app_draw_ref_result(Canvas* canvas, BulkWriterApp* app) {
     
     canvas_set_font(canvas, FontSecondary);
     
-    char proto_str[32], fc_cn_str[32], reader_str[32];
+    char proto_str[32], fc_cn_str[32], mod_str[32];
     snprintf(proto_str, sizeof(proto_str), "Protocol: %s", app->ref_proto_name);
     snprintf(fc_cn_str, sizeof(fc_cn_str), "FC: %u  CN: %lu", app->ref_fc, app->ref_cn);
     
-    const char* reader_types[] = {"LF Reader", "NFC Reader", "Auto"};
-    snprintf(reader_str, sizeof(reader_str), "Reader: %s", reader_types[app->ref_reader_type]);
+    const char* mod_names[] = {"Auto (LF+NFC)", "ASK (125k)", "PSK (125k)", "NFC (13.56M)"};
+    snprintf(mod_str, sizeof(mod_str), "Mode: %s (locked)", mod_names[app->ref_mod_type]);
     
     canvas_draw_str(canvas, 4, 26, proto_str);
     canvas_draw_str(canvas, 4, 38, fc_cn_str);
-    canvas_draw_str(canvas, 4, 50, reader_str);
+    canvas_draw_str(canvas, 4, 50, mod_str);
     
     canvas_draw_str_aligned(canvas, 64, 62, AlignCenter, AlignBottom, "[ OK ]");
 }
@@ -535,14 +516,14 @@ static void app_draw_ref_result(Canvas* canvas, BulkWriterApp* app) {
 static void app_draw_ready(Canvas* canvas, BulkWriterApp* app) {
     canvas_clear(canvas);
     canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str_aligned(canvas, 64, 12, AlignCenter, AlignTop, "Bulk Writer");
+    canvas_draw_str_aligned(canvas, 64, 12, AlignCenter, AlignTop, "Bulk Writer Enhanced");
     
     canvas_set_font(canvas, FontSecondary);
     
     char status_str[32];
-    const char* reader_types[] = {"LF", "NFC", "Auto"};
+    const char* mod_names[] = {"Auto", "ASK", "PSK", "NFC"};
     snprintf(status_str, sizeof(status_str), "%s | FC: %u | Cards: %u", 
-             reader_types[app->reader_type], app->target_fc, app->cards_written);
+             mod_names[app->mod_select], app->target_fc, app->cards_written);
     
     canvas_draw_str_aligned(canvas, 64, 28, AlignCenter, AlignCenter, status_str);
     canvas_draw_str_aligned(canvas, 64, 40, AlignCenter, AlignCenter, "Place card on reader");
@@ -618,9 +599,7 @@ static void input_callback(InputEvent* input_event, void* context) {
                     if(app->config_cursor > 0) app->config_cursor--;
                     break;
                 case InputKeyDown:
-                    // Max cursor depends on reader type
-                    uint8_t max_cursor = (app->reader_type == ReaderType_NFC) ? 2 : 3;
-                    if(app->config_cursor < max_cursor) app->config_cursor++;
+                    if(app->config_cursor < 2) app->config_cursor++; // 3 fields: FC, CN, Mod
                     break;
                 case InputKeyLeft:
                     switch(app->config_cursor) {
@@ -630,10 +609,7 @@ static void input_callback(InputEvent* input_event, void* context) {
                         case 1: // Card number mode
                             if(app->card_num_mode > 0) app->card_num_mode--;
                             break;
-                        case 2: // Reader type
-                            if(app->reader_type > 0) app->reader_type--;
-                            break;
-                        case 3: // Modulation (LFRFID only)
+                        case 2: // Modulation/Reader type
                             if(app->mod_select > 0) app->mod_select--;
                             break;
                     }
@@ -646,29 +622,28 @@ static void input_callback(InputEvent* input_event, void* context) {
                         case 1: // Card number mode
                             if(app->card_num_mode < CardNumMode_COUNT - 1) app->card_num_mode++;
                             break;
-                        case 2: // Reader type
-                            if(app->reader_type < ReaderType_COUNT - 1) app->reader_type++;
-                            break;
-                        case 3: // Modulation or Reference Scan
-                            if(app->reader_type == ReaderType_LFRFID || app->reader_type == ReaderType_Auto) {
-                                if(app->config_cursor == 3) {
-                                    // Start reference scan
-                                    app->current_screen = Screen_RefScan;
-                                    app->ref_scanned = false;
-                                    
-                                    // Start appropriate worker
-                                    if(app->reader_type == ReaderType_NFC) {
-                                        nfc_worker_start(app->nfc_worker, NfcWorkerStateRead, NULL, nfc_read_callback, app);
-                                    } else {
-                                        LFRFIDWorkerReadType read_type = LFRFIDWorkerReadTypeAuto;
-                                        if(app->mod_select == Mod_ASK) read_type = LFRFIDWorkerReadTypeASKOnly;
-                                        else if(app->mod_select == Mod_PSK) read_type = LFRFIDWorkerReadTypePSKOnly;
-                                        
-                                        lfrfid_worker_start_thread(app->lfrfid_worker);
-                                        lfrfid_worker_read_start(app->lfrfid_worker, read_type, lfrfid_read_callback, app);
-                                    }
+                        case 2: // Modulation or Reference Scan
+                            if(app->mod_select < Mod_COUNT - 1) {
+                                app->mod_select++;
+                            } else {
+                                // "Scan >" - Start reference scan
+                                app->current_screen = Screen_RefScan;
+                                app->ref_scanned = false;
+                                
+                                // Start appropriate worker based on current mod setting
+                                if(app->mod_select == Mod_NFC) {
+                                    nfc_worker_start(app->nfc_worker, NfcWorkerStateRead, NULL, nfc_read_callback, app);
+                                } else if(app->mod_select == Mod_Auto) {
+                                    // Start both for auto mode
+                                    lfrfid_worker_start_thread(app->lfrfid_worker);
+                                    lfrfid_worker_read_start(app->lfrfid_worker, LFRFIDWorkerReadTypeAuto, lfrfid_read_callback, app);
+                                    nfc_worker_start(app->nfc_worker, NfcWorkerStateRead, NULL, nfc_read_callback, app);
                                 } else {
-                                    if(app->mod_select < Mod_COUNT - 1) app->mod_select++;
+                                    // LF modes (ASK/PSK)
+                                    LFRFIDWorkerReadType read_type = (app->mod_select == Mod_ASK) ? 
+                                                                   LFRFIDWorkerReadTypeASKOnly : LFRFIDWorkerReadTypePSKOnly;
+                                    lfrfid_worker_start_thread(app->lfrfid_worker);
+                                    lfrfid_worker_read_start(app->lfrfid_worker, read_type, lfrfid_read_callback, app);
                                 }
                             }
                             break;
@@ -681,26 +656,26 @@ static void input_callback(InputEvent* input_event, void* context) {
                     app->cards_written = 0;
                     app->cards_failed = 0;
                     
-                    // Start readers based on type
-                    if(app->reader_type == ReaderType_NFC) {
+                    // Start readers based on modulation setting
+                    if(app->mod_select == Mod_NFC) {
                         nfc_worker_start(app->nfc_worker, NfcWorkerStateRead, NULL, nfc_read_callback, app);
-                    } else if(app->reader_type == ReaderType_LFRFID) {
-                        LFRFIDWorkerReadType read_type = LFRFIDWorkerReadTypeAuto;
-                        if(app->ref_scanned) {
+                    } else if(app->mod_select == Mod_Auto) {
+                        // Auto mode - start both LF and NFC
+                        lfrfid_worker_start_thread(app->lfrfid_worker);
+                        lfrfid_worker_read_start(app->lfrfid_worker, LFRFIDWorkerReadTypeAuto, lfrfid_read_callback, app);
+                        nfc_worker_start(app->nfc_worker, NfcWorkerStateRead, NULL, nfc_read_callback, app);
+                    } else {
+                        // LF modes (ASK/PSK)
+                        LFRFIDWorkerReadType read_type;
+                        if(app->ref_scanned && (app->ref_mod_type == Mod_ASK || app->ref_mod_type == Mod_PSK)) {
                             // Use locked modulation from reference scan
-                            read_type = (app->ref_reader_type == ReaderType_LFRFID) ? 
-                                       LFRFIDWorkerReadTypeASKOnly : LFRFIDWorkerReadTypePSKOnly;
+                            read_type = (app->ref_mod_type == Mod_ASK) ? LFRFIDWorkerReadTypeASKOnly : LFRFIDWorkerReadTypePSKOnly;
                         } else {
-                            if(app->mod_select == Mod_ASK) read_type = LFRFIDWorkerReadTypeASKOnly;
-                            else if(app->mod_select == Mod_PSK) read_type = LFRFIDWorkerReadTypePSKOnly;
+                            read_type = (app->mod_select == Mod_ASK) ? LFRFIDWorkerReadTypeASKOnly : LFRFIDWorkerReadTypePSKOnly;
                         }
                         
                         lfrfid_worker_start_thread(app->lfrfid_worker);
                         lfrfid_worker_read_start(app->lfrfid_worker, read_type, lfrfid_read_callback, app);
-                    } else { // Auto mode - start both
-                        lfrfid_worker_start_thread(app->lfrfid_worker);
-                        lfrfid_worker_read_start(app->lfrfid_worker, LFRFIDWorkerReadTypeAuto, lfrfid_read_callback, app);
-                        nfc_worker_start(app->nfc_worker, NfcWorkerStateRead, NULL, nfc_read_callback, app);
                     }
                     break;
                 case InputKeyBack:
@@ -836,16 +811,15 @@ static void save_settings(BulkWriterApp* app) {
     FlipperFormat* file = flipper_format_file_alloc(storage);
     
     if(flipper_format_file_open_new(file, BULKWRITER_CONFIG_PATH)) {
-        flipper_format_write_header_cstr(file, "BulkWriter Enhanced Config", 1);
+        flipper_format_write_header_cstr(file, "BulkWriter Enhanced Config", 2);
         flipper_format_write_uint32(file, "TargetFC", &app->target_fc, 1);
         flipper_format_write_uint32(file, "TargetCN", &app->target_cn, 1);
         flipper_format_write_uint32(file, "CardNumMode", (uint32_t*)&app->card_num_mode, 1);
-        flipper_format_write_uint32(file, "ReaderType", (uint32_t*)&app->reader_type, 1);
         flipper_format_write_uint32(file, "ModSelect", (uint32_t*)&app->mod_select, 1);
         flipper_format_write_bool(file, "RefScanned", &app->ref_scanned, 1);
         
         if(app->ref_scanned) {
-            flipper_format_write_uint32(file, "RefReaderType", (uint32_t*)&app->ref_reader_type, 1);
+            flipper_format_write_uint32(file, "RefModType", (uint32_t*)&app->ref_mod_type, 1);
             flipper_format_write_uint32(file, "RefLFRFIDProtocol", (uint32_t*)&app->ref_lfrfid_protocol, 1);
             flipper_format_write_uint32(file, "RefNFCProtocol", (uint32_t*)&app->ref_nfc_protocol, 1);
             flipper_format_write_string_cstr(file, "RefProtoName", app->ref_proto_name);
@@ -867,7 +841,6 @@ static void load_settings(BulkWriterApp* app) {
     app->target_fc = FC_DEFAULT;
     app->target_cn = CARD_NUM_DEFAULT;
     app->card_num_mode = CARD_NUM_MODE_DEFAULT;
-    app->reader_type = ReaderType_Auto;
     app->mod_select = MOD_DEFAULT;
     app->ref_scanned = false;
     
@@ -887,14 +860,11 @@ static void load_settings(BulkWriterApp* app) {
             if(flipper_format_read_uint32(file, "CardNumMode", &temp_value, 1)) {
                 app->card_num_mode = temp_value;
             }
-            if(flipper_format_read_uint32(file, "ReaderType", &temp_value, 1)) {
-                app->reader_type = temp_value;
-            }
             if(flipper_format_read_uint32(file, "ModSelect", &temp_value, 1)) {
                 app->mod_select = temp_value;
             }
             if(flipper_format_read_bool(file, "RefScanned", &app->ref_scanned, 1) && app->ref_scanned) {
-                flipper_format_read_uint32(file, "RefReaderType", (uint32_t*)&app->ref_reader_type, 1);
+                flipper_format_read_uint32(file, "RefModType", (uint32_t*)&app->ref_mod_type, 1);
                 flipper_format_read_uint32(file, "RefLFRFIDProtocol", (uint32_t*)&app->ref_lfrfid_protocol, 1);
                 flipper_format_read_uint32(file, "RefNFCProtocol", (uint32_t*)&app->ref_nfc_protocol, 1);
                 flipper_format_read_string_cstr(file, "RefProtoName", app->ref_proto_name, sizeof(app->ref_proto_name));
