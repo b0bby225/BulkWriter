@@ -1,9 +1,15 @@
 /**
- * Bulk Writer — Flipper Zero 125kHz Tag Reprogrammer
+ * Bulk Writer Enhanced — Flipper Zero Multi-Protocol Tag Reprogrammer
  *
- * Reads 125kHz LF tags, substitutes the facility code with a user-preset
- * value, and writes back to T5577-based cards. Designed for hands-free
- * bulk processing with LED/vibration feedback per card.
+ * Reads LFRFID 125kHz, NFC, and other RFID tags, substitutes the facility code
+ * with a user-preset value, and writes back to compatible cards. Designed for 
+ * hands-free bulk processing with LED/vibration feedback per card.
+ *
+ * Enhanced with support for:
+ * - All LF protocols (HID, EM4100, Indala, AWID, etc.)
+ * - NFC protocols (NTAG, Mifare Classic, etc.)
+ * - 13.56MHz protocols
+ * - Auto-detection of card types
  *
  * Architecture mirrors ClayLoop: ViewPort + input callback + draw callback,
  * state machine driven by input events, persistent settings via FlipperFormat.
@@ -23,14 +29,17 @@
 #include <flipper_format/flipper_format.h>
 #include <lib/lfrfid/lfrfid_worker.h>
 #include <lib/lfrfid/protocols/lfrfid_protocols.h>
+#include <lib/nfc/nfc.h>
+#include <lib/nfc/nfc_worker.h>
+#include <lib/nfc/protocols/nfc_protocols.h>
 
-#define TAG "BulkWriter"
+#define TAG "BulkWriterEnhanced"
 
 /* ══════════════════════════════════════════════════════════════════════════════
  *  CONSTANTS & DEFAULTS
  * ══════════════════════════════════════════════════════════════════════════════ */
 
-/** Persistent settings file path (same pattern as ClayLoop) */
+/** Persistent settings file path */
 #define BULKWRITER_CONFIG_DIR  "/ext/apps_data/bulk_writer"
 #define BULKWRITER_CONFIG_PATH "/ext/apps_data/bulk_writer/config.ff"
 
@@ -50,42 +59,40 @@ typedef enum {
 #define CARD_NUM_DEFAULT      0
 #define CARD_NUM_MODE_DEFAULT CardNumMode_Preserve
 
-/** Modulation selection — determines LFRFIDWorkerReadType */
+/** Modulation/Reader selection */
 typedef enum {
-    Mod_Auto = 0,    /** Auto-detect (slowest — cycles ASK+PSK) */
-    Mod_ASK,          /** ASK only (HID, EM4100, most common) */
-    Mod_PSK,          /** PSK only (Indala, AWID, etc.) */
-    Mod_NFC,          /** NFC 13.56MHz mode */
+    Mod_Auto = 0,    /** Auto-detect all protocols (LF + NFC) */
+    Mod_ASK,         /** LF ASK only (HID, EM4100, most common) */
+    Mod_PSK,         /** LF PSK only (Indala, AWID, etc.) */
+    Mod_NFC,         /** NFC 13.56MHz only (NTAG, Mifare) */
     Mod_COUNT
 } ModSelect;
 
 #define MOD_DEFAULT Mod_Auto
-
-/** Max cards we track in session stats */
-#define MAX_LOG_ENTRIES 999
 
 /* ══════════════════════════════════════════════════════════════════════════════
  *  APPLICATION SCREENS (state machine — same pattern as ClayLoop)
  * ══════════════════════════════════════════════════════════════════════════════ */
 
 typedef enum {
-    Screen_Config,       /** FC, card number mode, modulation selection */
+    Screen_Config,       /** FC, card number mode, reader type + modulation selection */
     Screen_RefScan,      /** "Scan Reference Card" — learning modulation + protocol */
     Screen_RefResult,    /** Show what was detected from reference scan */
     Screen_Ready,        /** "Place card on reader" — idle waiting */
     Screen_Reading,      /** Active read in progress */
-    Screen_Writing,      /** Active write in progress */
-    Screen_Success,      /** Card written OK — brief flash */
-    Screen_Error,        /** Write failed — brief flash */
-    Screen_Summary,      /** Session stats */
+    Screen_Processing,   /** Modifying data and writing */
+    Screen_Success,      /** Write success with brief flash */
+    Screen_Error,        /** Write failed with error message */
+    Screen_Summary,      /** Session stats (cards written/failed) */
+    Screen_COUNT
 } AppScreen;
 
 /* ══════════════════════════════════════════════════════════════════════════════
- *  APPLICATION STATE
+ *  APPLICATION STATE STRUCTURE
  * ══════════════════════════════════════════════════════════════════════════════ */
 
 typedef struct {
-    /* GUI */
+    /* Core UI */
     Gui* gui;
     ViewPort* view_port;
     FuriMessageQueue* event_queue;
@@ -93,140 +100,76 @@ typedef struct {
     /* Notifications (LED, vibro, speaker) */
     NotificationApp* notifications;
 
-    /* LFRFID */
-    LFRFIDWorker* lf_worker;
-    ProtocolDict* protocol_dict;
+    /* LFRFID worker and protocols */
+    LFRFIDWorker* lfrfid_worker;
+    ProtocolDict* lfrfid_protocol_dict;
+
+    /* NFC worker and protocols */
+    Nfc* nfc;
+    NfcWorker* nfc_worker;
+    NfcProtocol* nfc_protocol_dict;
 
     /* Current screen state */
     AppScreen current_screen;
 
-    /* Config (persisted) */
-    uint8_t facility_code;
-    CardNumMode card_num_mode;
-    uint16_t card_num_base;       /** Base for sequential or fixed value */
-    ModSelect mod_select;          /** ASK / PSK / Auto modulation */
-    bool verify_after_write;      /** Read-back verification */
+    /* User configuration */
+    uint8_t target_fc;               /** Target facility code (0-255) */
+    uint32_t target_cn;              /** Target card number (for Fixed mode) */
+    CardNumMode card_num_mode;       /** How to handle card numbers */
+    ModSelect mod_select;            /** Modulation/reader type selection */
 
     /* Config screen cursor */
-    uint8_t config_cursor;        /** Which config field is selected */
+    uint8_t config_cursor;           /** Which config field is selected */
 
     /* Reference scan state */
-    bool ref_scanned;              /** True if a reference card was scanned */
-    LFRFIDProtocol ref_protocol;   /** Protocol learned from reference scan */
-    LFRFIDWorkerReadType ref_read_type; /** Read type learned (ASK/PSK) */
-    char ref_proto_name[32];       /** Human-readable protocol name from reference */
-    uint8_t ref_fc;                /** FC extracted from reference card */
-    uint16_t ref_cn;               /** CN extracted from reference card */
+    bool ref_scanned;                /** True if a reference card was scanned */
+    ModSelect ref_mod_type;          /** Which modulation/reader was used for ref */
+    ProtocolId ref_lfrfid_protocol;  /** LFRFID protocol from reference */
+    NfcProtocolId ref_nfc_protocol;  /** NFC protocol from reference */
+    char ref_proto_name[32];         /** Human-readable protocol name from reference */
+    uint8_t ref_fc;                  /** FC extracted from reference card */
+    uint32_t ref_cn;                 /** CN extracted from reference card */
 
     /* Runtime state */
-    bool running;                 /** Main processing loop active */
-    bool worker_busy;             /** LFRFID worker callback in progress */
+    bool running;                    /** Main processing loop active */
+    ModSelect active_mod;            /** Currently active modulation/reader */
+    ProtocolId last_lfrfid_protocol; /** Last LFRFID protocol detected */
+    NfcProtocolId last_nfc_protocol; /** Last NFC protocol detected */
 
     /* Last read data */
-    LFRFIDProtocol last_protocol; /** Protocol detected on last read */
-    uint8_t last_data[16];        /** Raw protocol data from last read */
+    uint8_t last_data[64];           /** Raw protocol data from last read (increased for NFC) */
     size_t last_data_size;
 
     /* Session counters */
     uint16_t cards_written;
     uint16_t cards_failed;
-    uint16_t next_sequential;     /** Next card number for sequential mode */
+
+    /* Error state */
+    char error_msg[64];              /** Last error message */
 } BulkWriterApp;
 
 /* ══════════════════════════════════════════════════════════════════════════════
- *  LED / NOTIFICATION SEQUENCES
- *  (Same approach as ClayLoop — predefined notification_message sequences)
+ *  EVENT SYSTEM
  * ══════════════════════════════════════════════════════════════════════════════ */
 
-/** Green blink + short vibro = card written OK */
-static const NotificationSequence seq_success = {
-    &message_green_255,
-    &message_vibro_on,
-    &message_delay_100,
-    &message_vibro_off,
-    &message_delay_500,
-    &message_green_0,
-    NULL,
-};
+typedef enum {
+    EventTypeRead,    /** Card read event */
+    EventTypeWrite,   /** Card write event */
+    EventTypeExit,    /** Exit app event */
+} AppEventType;
 
-/** Red blink + double vibro = write failed */
-static const NotificationSequence seq_error = {
-    &message_red_255,
-    &message_vibro_on,
-    &message_delay_100,
-    &message_vibro_off,
-    &message_delay_50,
-    &message_vibro_on,
-    &message_delay_100,
-    &message_vibro_off,
-    &message_delay_250,
-    &message_red_0,
-    NULL,
-};
-
-/** Blue pulse = reading */
-static const NotificationSequence seq_reading = {
-    &message_blue_255,
-    &message_delay_250,
-    &message_blue_0,
-    NULL,
-};
-
-/** Purple (red+blue) pulse = writing */
-static const NotificationSequence seq_writing = {
-    &message_red_255,
-    &message_blue_255,
-    &message_delay_250,
-    &message_red_0,
-    &message_blue_0,
-    NULL,
-};
-
+typedef struct {
+    AppEventType type;
+} AppEvent;
 /* ══════════════════════════════════════════════════════════════════════════════
- *  SPEAKER BEEP HELPERS (same approach as ClayLoop)
- *
- *  Success: ascending double beep (880 Hz → 1100 Hz) — cheerful
- *  Error:   descending double buzz (440 Hz → 220 Hz) — unmistakably bad
+ *  STATIC FUNCTION DECLARATIONS
  * ══════════════════════════════════════════════════════════════════════════════ */
 
-static void beep_success(void) {
-    if(furi_hal_speaker_acquire(100)) {
-        /* First tone: 880 Hz for 100ms */
-        furi_hal_speaker_start(880.0f, 1.0f);
-        furi_delay_ms(100);
-        furi_hal_speaker_stop();
-        furi_delay_ms(50);
-        /* Second tone: 1100 Hz for 100ms */
-        furi_hal_speaker_start(1100.0f, 1.0f);
-        furi_delay_ms(100);
-        furi_hal_speaker_stop();
-        furi_hal_speaker_release();
-    }
-}
+/** Event handling */
+static void input_callback(InputEvent* input_event, void* context);
+static void draw_callback(Canvas* canvas, void* context);
 
-static void beep_error(void) {
-    if(furi_hal_speaker_acquire(100)) {
-        /* First tone: 440 Hz for 150ms */
-        furi_hal_speaker_start(440.0f, 1.0f);
-        furi_delay_ms(150);
-        furi_hal_speaker_stop();
-        furi_delay_ms(50);
-        /* Second tone: 220 Hz for 250ms — low buzz */
-        furi_hal_speaker_start(220.0f, 1.0f);
-        furi_delay_ms(250);
-        furi_hal_speaker_stop();
-        furi_hal_speaker_release();
-    }
-}
-
-/* ══════════════════════════════════════════════════════════════════════════════
- *  FORWARD DECLARATIONS
- * ══════════════════════════════════════════════════════════════════════════════ */
-
-static void app_draw_callback(Canvas* canvas, void* context);
-static void app_input_callback(InputEvent* input_event, void* context);
-static void app_save_settings(BulkWriterApp* app);
-static void app_load_settings(BulkWriterApp* app);
+/** Screen drawing functions */
 static void app_draw_config(Canvas* canvas, BulkWriterApp* app);
 static void app_draw_ref_scan(Canvas* canvas, BulkWriterApp* app);
 static void app_draw_ref_result(Canvas* canvas, BulkWriterApp* app);
@@ -234,340 +177,567 @@ static void app_draw_ready(Canvas* canvas, BulkWriterApp* app);
 static void app_draw_processing(Canvas* canvas, BulkWriterApp* app);
 static void app_draw_result(Canvas* canvas, BulkWriterApp* app);
 static void app_draw_summary(Canvas* canvas, BulkWriterApp* app);
-static LFRFIDWorkerReadType app_get_read_type(BulkWriterApp* app);
+
+/** Protocol helpers */
+static bool extract_hid_h10301(const uint8_t* data, size_t size, uint8_t* fc, uint32_t* cn);
+static bool inject_hid_h10301(uint8_t* data, size_t size, uint8_t fc, uint32_t cn);
+static bool extract_em4100(const uint8_t* data, size_t size, uint8_t* fc, uint32_t* cn);
+static bool inject_em4100(uint8_t* data, size_t size, uint8_t fc, uint32_t cn);
+static bool extract_nfc_data(NfcProtocolId protocol, const uint8_t* data, size_t size, uint8_t* fc, uint32_t* cn);
+static bool inject_nfc_data(NfcProtocolId protocol, uint8_t* data, size_t size, uint8_t fc, uint32_t cn);
+
+/** LFRFID worker callbacks */
+static void lfrfid_read_callback(ProtocolId protocol, void* context);
+
+/** NFC worker callbacks */
+static void nfc_read_callback(NfcProtocolId protocol, void* context);
+
+/** Settings persistence */
+static void save_settings(BulkWriterApp* app);
+static void load_settings(BulkWriterApp* app);
+
+/** Notifications */
+static void play_success_sound(BulkWriterApp* app);
+static void play_failure_sound(BulkWriterApp* app);
+static void show_success_led(BulkWriterApp* app);
+static void show_failure_led(BulkWriterApp* app);
+static void show_processing_led(BulkWriterApp* app);
 
 /* ══════════════════════════════════════════════════════════════════════════════
  *  PROTOCOL HELPERS
  *
  *  HID H10301 (26-bit): [1 parity][8 FC][16 CN][1 parity]
  *  EM4100:              [8-bit version/FC][32-bit ID] with row/col parity
+ *  NFC protocols:       Variable structure depending on protocol
  *
  *  These helpers extract/inject facility code and card number from the
- *  raw protocol data bytes stored by the LFRFID protocol dictionary.
+ *  protocol data structures.
  * ══════════════════════════════════════════════════════════════════════════════ */
 
 /**
  * Extract facility code and card number from HID H10301 26-bit data.
- * Data layout in protocol_dict: 3 bytes = [parity+FC_high] [FC_low+CN_high] [CN_low+parity]
- * Bit layout: P FFFFFFFF CCCCCCCCCCCCCCCC P
  */
-static bool hid_h10301_extract(
-    const uint8_t* data,
-    size_t data_size,
-    uint8_t* fc_out,
-    uint16_t* cn_out) {
-    if(data_size < 3) return false;
-
-    /* Reassemble 26 bits from 3 bytes (MSB first, bits 7..1 of byte 0 = P+FC[7:1]) */
-    uint32_t raw = ((uint32_t)data[0] << 16) | ((uint32_t)data[1] << 8) | data[2];
-
-    /* Bits 25..0: [25]=even parity, [24..17]=FC, [16..1]=CN, [0]=odd parity */
-    *fc_out = (raw >> 17) & 0xFF;
-    *cn_out = (raw >> 1) & 0xFFFF;
+static bool extract_hid_h10301(const uint8_t* data, size_t size, uint8_t* fc, uint32_t* cn) {
+    if(!data || size < 3 || !fc || !cn) return false;
+    
+    // HID H10301: 26 bits total = [1 parity][8 FC][16 CN][1 parity]
+    // Data layout in protocol_dict: 3 bytes = [parity+FC_high] [FC_low+CN_high] [CN_low+parity]
+    uint32_t raw_data = (data[0] << 16) | (data[1] << 8) | data[2];
+    
+    // Strip leading parity bit and extract FC (next 8 bits)
+    *fc = (raw_data >> 17) & 0xFF;
+    
+    // Extract CN (next 16 bits)
+    *cn = (raw_data >> 1) & 0xFFFF;
+    
     return true;
 }
 
 /**
- * Encode HID H10301 26-bit data with new FC and CN, recalculating parity.
+ * Inject new facility code and card number into HID H10301 26-bit data.
  */
-static bool hid_h10301_encode(
-    uint8_t* data,
-    size_t data_size,
-    uint8_t fc,
-    uint16_t cn) {
-    if(data_size < 3) return false;
-
-    uint32_t raw = 0;
-    raw |= ((uint32_t)fc << 17);
-    raw |= ((uint32_t)cn << 1);
-
-    /* Even parity over bits 25..14 (high 12 data bits) */
-    uint8_t even_parity = 0;
-    for(int i = 25; i >= 14; i--) {
-        even_parity ^= (raw >> i) & 1;
+static bool inject_hid_h10301(uint8_t* data, size_t size, uint8_t fc, uint32_t cn) {
+    if(!data || size < 3 || cn > 0xFFFF) return false;
+    
+    // Build new 26-bit value: [1 parity][8 FC][16 CN][1 parity]
+    uint32_t new_data = (fc << 17) | ((cn & 0xFFFF) << 1);
+    
+    // Calculate even parity for FC field (bits 17-24)
+    uint8_t fc_parity = 0;
+    for(int i = 17; i <= 24; i++) {
+        if(new_data & (1 << i)) fc_parity ^= 1;
     }
-    if(even_parity) raw |= (1 << 25); /* bit 25 = even parity bit */
-
-    /* Odd parity over bits 12..1 (low 12 data bits) */
-    uint8_t odd_parity = 1;
-    for(int i = 12; i >= 1; i--) {
-        odd_parity ^= (raw >> i) & 1;
+    
+    // Calculate odd parity for CN field (bits 1-16)
+    uint8_t cn_parity = 1; // Start with 1 for odd parity
+    for(int i = 1; i <= 16; i++) {
+        if(new_data & (1 << i)) cn_parity ^= 1;
     }
-    if(odd_parity) raw |= 1; /* bit 0 = odd parity bit */
-
-    data[0] = (raw >> 16) & 0xFF;
-    data[1] = (raw >> 8) & 0xFF;
-    data[2] = raw & 0xFF;
+    
+    // Set parity bits
+    new_data |= (fc_parity << 25) | cn_parity;
+    
+    // Pack back into data array
+    data[0] = (new_data >> 16) & 0xFF;
+    data[1] = (new_data >> 8) & 0xFF;
+    data[2] = new_data & 0xFF;
+    
     return true;
 }
 
 /**
- * Extract facility code (version byte) and ID from EM4100 data.
- * Data layout: 5 bytes = [FC/version][ID3][ID2][ID1][ID0]
+ * Extract facility code and card number from EM4100 data.
  */
-static bool em4100_extract(
-    const uint8_t* data,
-    size_t data_size,
-    uint8_t* fc_out,
-    uint16_t* cn_out) {
-    if(data_size < 5) return false;
-
-    *fc_out = data[0];
-    /* Use lower 16 bits of the 32-bit ID as card number */
-    *cn_out = ((uint16_t)data[3] << 8) | data[4];
+static bool extract_em4100(const uint8_t* data, size_t size, uint8_t* fc, uint32_t* cn) {
+    if(!data || size < 5 || !fc || !cn) return false;
+    
+    // EM4100: 5 bytes = [version/FC][ID byte 3][ID byte 2][ID byte 1][ID byte 0]
+    *fc = data[0];
+    *cn = (data[1] << 24) | (data[2] << 16) | (data[3] << 8) | data[4];
+    
     return true;
 }
 
 /**
- * Encode EM4100 data with new FC, preserving upper ID bytes.
+ * Inject new facility code and card number into EM4100 data.
  */
-static bool em4100_encode(
-    uint8_t* data,
-    size_t data_size,
-    uint8_t fc,
-    uint16_t cn) {
-    if(data_size < 5) return false;
-
+static bool inject_em4100(uint8_t* data, size_t size, uint8_t fc, uint32_t cn) {
+    if(!data || size < 5) return false;
+    
     data[0] = fc;
-    /* Preserve data[1], data[2] (upper ID bytes) unless in fixed/sequential mode */
+    data[1] = (cn >> 24) & 0xFF;
+    data[2] = (cn >> 16) & 0xFF;
     data[3] = (cn >> 8) & 0xFF;
     data[4] = cn & 0xFF;
+    
     return true;
 }
 
+/**
+ * Extract facility code and card number from NFC data.
+ * Note: Implementation depends on specific NFC protocol.
+ */
+static bool extract_nfc_data(NfcProtocolId protocol, const uint8_t* data, size_t size, uint8_t* fc, uint32_t* cn) {
+    if(!data || !fc || !cn) return false;
+    
+    switch(protocol) {
+        case NfcProtocolIdNtag213:
+        case NfcProtocolIdNtag215:
+        case NfcProtocolIdNtag216:
+            // NTAG cards - extract from user memory area
+            if(size >= 8) {
+                *fc = data[4];  // Facility code at offset 4
+                *cn = (data[5] << 16) | (data[6] << 8) | data[7];  // 24-bit card number
+                return true;
+            }
+            break;
+            
+        case NfcProtocolIdMfClassic1k:
+        case NfcProtocolIdMfClassic4k:
+            // Mifare Classic - extract from sector data
+            if(size >= 16) {
+                *fc = data[0];  // FC in first byte of user data
+                *cn = (data[1] << 24) | (data[2] << 16) | (data[3] << 8) | data[4];  // 32-bit CN
+                return true;
+            }
+            break;
+            
+        default:
+            return false;
+    }
+    
+    return false;
+}
+
+/**
+ * Inject new facility code and card number into NFC data.
+ */
+static bool inject_nfc_data(NfcProtocolId protocol, uint8_t* data, size_t size, uint8_t fc, uint32_t cn) {
+    if(!data) return false;
+    
+    switch(protocol) {
+        case NfcProtocolIdNtag213:
+        case NfcProtocolIdNtag215:
+        case NfcProtocolIdNtag216:
+            // NTAG cards - inject into user memory area
+            if(size >= 8) {
+                data[4] = fc;
+                data[5] = (cn >> 16) & 0xFF;
+                data[6] = (cn >> 8) & 0xFF;
+                data[7] = cn & 0xFF;
+                return true;
+            }
+            break;
+            
+        case NfcProtocolIdMfClassic1k:
+        case NfcProtocolIdMfClassic4k:
+            // Mifare Classic - inject into sector data
+            if(size >= 16) {
+                data[0] = fc;
+                data[1] = (cn >> 24) & 0xFF;
+                data[2] = (cn >> 16) & 0xFF;
+                data[3] = (cn >> 8) & 0xFF;
+                data[4] = cn & 0xFF;
+                return true;
+            }
+            break;
+            
+        default:
+            return false;
+    }
+    
+    return false;
+}
 /* ══════════════════════════════════════════════════════════════════════════════
  *  LFRFID WORKER CALLBACKS
  * ══════════════════════════════════════════════════════════════════════════════ */
 
-/** Called by LFRFID worker when a tag is successfully read */
-static void lfrfid_read_callback(LFRFIDWorkerReadResult result, ProtocolId protocol, void* context) {
-    BulkWriterApp* app = context;
-
-    if(result == LFRFIDWorkerReadDone) {
-        app->last_protocol = protocol;
-        app->last_data_size = protocol_dict_get_data_size(app->protocol_dict, protocol);
-        if(app->last_data_size > sizeof(app->last_data)) {
-            app->last_data_size = sizeof(app->last_data);
-        }
-        protocol_dict_get_data(app->protocol_dict, protocol, app->last_data, app->last_data_size);
-
-        FURI_LOG_I(TAG, "Read OK: protocol=%ld, data_size=%zu", protocol, app->last_data_size);
-
-        /* Signal main loop: transition to write phase */
-        InputEvent event = {.type = InputTypePress, .key = InputKeyMAX};
-        furi_message_queue_put(app->event_queue, &event, 0);
-    }
-}
-
 /**
- * Called by LFRFID worker during reference card scan.
- * Learns the protocol, modulation type, FC and CN from the scanned card
- * and locks the read type for all subsequent bulk reads.
+ * LFRFID read callback - triggered when a 125kHz tag is detected.
  */
-static void lfrfid_ref_scan_callback(LFRFIDWorkerReadResult result, ProtocolId protocol, void* context) {
+static void lfrfid_read_callback(ProtocolId protocol, void* context) {
     BulkWriterApp* app = context;
-
-    if(result == LFRFIDWorkerReadDone) {
-        /* Store protocol info */
-        app->ref_protocol = protocol;
-        app->ref_scanned = true;
-
-        /* Get protocol name */
-        const char* name = protocol_dict_get_name(app->protocol_dict, protocol);
-        snprintf(app->ref_proto_name, sizeof(app->ref_proto_name), "%s", name);
-
-        /* Read data to extract FC/CN for display */
-        size_t data_size = protocol_dict_get_data_size(app->protocol_dict, protocol);
-        uint8_t data[16];
-        if(data_size > sizeof(data)) data_size = sizeof(data);
-        protocol_dict_get_data(app->protocol_dict, protocol, data, data_size);
-
-        /* Determine modulation from data size heuristic:
-         * ASK protocols (HID, EM4100, FDX-B, etc.) are the vast majority of 125kHz.
-         * PSK protocols (Indala, AWID, IoProx) are less common.
-         * The LFRFID protocol registry groups them, but we can infer from the
-         * protocol name or just default to ASK since the worker already decoded it.
-         *
-         * A more robust approach: try ASK-only read first, if it succeeds the card
-         * is ASK. But since we used Auto for the ref scan, we check protocol names.
-         */
-        /* Default to ASK — most 125kHz cards are ASK modulated */
-        app->ref_read_type = LFRFIDWorkerReadTypeASKOnly;
-
-        /* Known PSK protocols */
-        if(strstr(app->ref_proto_name, "Indala") ||
-           strstr(app->ref_proto_name, "AWID") ||
-           strstr(app->ref_proto_name, "IoProx") ||
-           strstr(app->ref_proto_name, "Paradox") ||
-           strstr(app->ref_proto_name, "Keri")) {
-            app->ref_read_type = LFRFIDWorkerReadTypePSKOnly;
-        }
-
-        /* Extract FC/CN for display */
-        app->ref_fc = 0;
-        app->ref_cn = 0;
-        if(data_size == 3) {
-            hid_h10301_extract(data, data_size, &app->ref_fc, &app->ref_cn);
-        } else if(data_size >= 5) {
-            em4100_extract(data, data_size, &app->ref_fc, &app->ref_cn);
-        }
-
-        FURI_LOG_I(TAG, "Reference scan: %s, FC=%d CN=%d, read_type=%d",
-            app->ref_proto_name, app->ref_fc, app->ref_cn, app->ref_read_type);
-
-        /* Signal main loop */
-        InputEvent event = {.type = InputTypePress, .key = InputKeyMAX};
+    
+    // Copy protocol data
+    app->last_lfrfid_protocol = protocol;
+    app->last_data_size = protocol_dict_get_data_size(app->lfrfid_protocol_dict, protocol);
+    if(app->last_data_size > sizeof(app->last_data)) {
+        app->last_data_size = sizeof(app->last_data);
+    }
+    
+    protocol_dict_get_data(app->lfrfid_protocol_dict, protocol, app->last_data, app->last_data_size);
+    
+    // Send read event to main loop
+    if(app->event_queue) {
+        AppEvent event = {.type = EventTypeRead};
         furi_message_queue_put(app->event_queue, &event, 0);
     }
-}
-
-/** Called by LFRFID worker when a write completes */
-static void lfrfid_write_callback(LFRFIDWorkerWriteResult result, void* context) {
-    BulkWriterApp* app = context;
-
-    if(result == LFRFIDWorkerWriteOK) {
-        app->cards_written++;
-        app->current_screen = Screen_Success;
-        FURI_LOG_I(TAG, "Write OK: total=%d", app->cards_written);
-    } else {
-        app->cards_failed++;
-        app->current_screen = Screen_Error;
-        FURI_LOG_E(TAG, "Write FAIL: total_fail=%d", app->cards_failed);
-    }
-    app->worker_busy = false;
-
-    /* Signal main loop to update display */
-    InputEvent event = {.type = InputTypePress, .key = InputKeyMAX};
-    furi_message_queue_put(app->event_queue, &event, 0);
 }
 
 /* ══════════════════════════════════════════════════════════════════════════════
- *  CORE PROCESSING LOGIC
+ *  NFC WORKER CALLBACKS  
  * ══════════════════════════════════════════════════════════════════════════════ */
 
 /**
- * Process a read tag: extract FC/CN, substitute FC, optionally adjust CN,
- * encode back, and initiate write.
- *
- * Protocol detection: uses data_size from the protocol dict to determine
- * whether this is HID H10301 (3 bytes) or EM4100 (5 bytes). If a reference
- * card was scanned, we already know which protocol to expect.
+ * NFC read callback - triggered when a 13.56MHz tag is detected.
  */
-static bool app_process_tag(BulkWriterApp* app) {
-    uint8_t orig_fc = 0;
-    uint16_t orig_cn = 0;
-    bool extracted = false;
-    bool is_hid = false;
-
-    /* Identify protocol and extract fields */
-    const char* proto_name = protocol_dict_get_name(app->protocol_dict, app->last_protocol);
-    FURI_LOG_I(TAG, "Processing protocol: %s (data_size=%zu)", proto_name, app->last_data_size);
-
-    /* Try HID H10301 first (3 bytes = 26-bit format) */
-    if(app->last_data_size == 3) {
-        extracted = hid_h10301_extract(app->last_data, app->last_data_size, &orig_fc, &orig_cn);
-        if(extracted) is_hid = true;
+static void nfc_read_callback(NfcProtocolId protocol, void* context) {
+    BulkWriterApp* app = context;
+    
+    // Copy protocol data
+    app->last_nfc_protocol = protocol;
+    app->active_mod = Mod_NFC;
+    
+    // Get NFC data (implementation depends on NFC API structure)
+    // This is a simplified example - actual implementation would vary
+    NfcData* nfc_data = nfc_worker_get_nfc_data(app->nfc_worker);
+    if(nfc_data && nfc_data->protocol_data_size <= sizeof(app->last_data)) {
+        app->last_data_size = nfc_data->protocol_data_size;
+        memcpy(app->last_data, nfc_data->protocol_data, app->last_data_size);
     }
-
-    /* Try EM4100 (5 bytes) */
-    if(!extracted && app->last_data_size >= 5) {
-        extracted = em4100_extract(app->last_data, app->last_data_size, &orig_fc, &orig_cn);
+    
+    // Send read event to main loop
+    if(app->event_queue) {
+        AppEvent event = {.type = EventTypeRead};
+        furi_message_queue_put(app->event_queue, &event, 0);
     }
+}
 
-    if(!extracted) {
-        FURI_LOG_E(TAG, "Could not extract FC/CN from protocol data");
-        return false;
+/* ══════════════════════════════════════════════════════════════════════════════
+ *  SCREEN DRAWING FUNCTIONS
+ * ══════════════════════════════════════════════════════════════════════════════ */
+
+static void app_draw_config(Canvas* canvas, BulkWriterApp* app) {
+    canvas_clear(canvas);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 2, 10, "Bulk Writer Enhanced");
+    
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_line(canvas, 0, 13, 128, 13);
+    
+    // Field labels and values
+    char fc_str[16], cn_str[32], mod_str[20];
+    const char* cn_modes[] = {"Preserve", "Sequential", "Fixed"};
+    const char* mod_names[] = {"Auto (LF+NFC)", "ASK (125k)", "PSK (125k)", "NFC (13.56M)"};
+    
+    snprintf(fc_str, sizeof(fc_str), "FC: %u", app->target_fc);
+    snprintf(cn_str, sizeof(cn_str), "CN: %s", cn_modes[app->card_num_mode]);
+    snprintf(mod_str, sizeof(mod_str), "%s", mod_names[app->mod_select]);
+    
+    // Draw fields with cursor highlighting
+    uint8_t y_pos = 24;
+    
+    // FC field
+    if(app->config_cursor == 0) canvas_draw_box(canvas, 0, y_pos - 9, 128, 11);
+    canvas_draw_str(canvas, 2, y_pos, app->config_cursor == 0 ? ">" : " ");
+    canvas_draw_str(canvas, 8, y_pos, fc_str);
+    canvas_draw_str(canvas, 110, y_pos, "<L/R>");
+    y_pos += 12;
+    
+    // CN mode field  
+    if(app->config_cursor == 1) canvas_draw_box(canvas, 0, y_pos - 9, 128, 11);
+    canvas_draw_str(canvas, 2, y_pos, app->config_cursor == 1 ? ">" : " ");
+    canvas_draw_str(canvas, 8, y_pos, cn_str);
+    y_pos += 12;
+    
+    // Modulation/Reader field (unified)
+    if(app->config_cursor == 2) canvas_draw_box(canvas, 0, y_pos - 9, 128, 11);
+    canvas_draw_str(canvas, 2, y_pos, app->config_cursor == 2 ? ">" : " ");
+    canvas_draw_str(canvas, 8, y_pos, "Mod: ");
+    canvas_draw_str(canvas, 35, y_pos, mod_str);
+    canvas_draw_str(canvas, 90, y_pos, "Scan >");
+    
+    // Instructions
+    canvas_draw_str_aligned(canvas, 64, 60, AlignCenter, AlignBottom, "[ Start ]");
+}
+
+static void app_draw_ref_scan(Canvas* canvas, BulkWriterApp* app) {
+    canvas_clear(canvas);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 15, 12, "Scan Reference");
+    
+    canvas_set_font(canvas, FontSecondary);
+    
+    const char* reader_msg = "";
+    switch(app->mod_select) {
+        case Mod_ASK:
+        case Mod_PSK: reader_msg = "Place LF card on reader"; break;
+        case Mod_NFC: reader_msg = "Place NFC card on reader"; break;
+        case Mod_Auto: reader_msg = "Place any card on reader"; break;
     }
+    
+    canvas_draw_str_aligned(canvas, 64, 32, AlignCenter, AlignCenter, reader_msg);
+    canvas_draw_str_aligned(canvas, 64, 44, AlignCenter, AlignCenter, "to auto-detect protocol");
+    
+    canvas_draw_str(canvas, 2, 62, "[Back]");
+}
 
-    FURI_LOG_I(TAG, "Original: FC=%d CN=%d", orig_fc, orig_cn);
+static void app_draw_ref_result(Canvas* canvas, BulkWriterApp* app) {
+    canvas_clear(canvas);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 8, 12, "Reference Detected!");
+    
+    canvas_set_font(canvas, FontSecondary);
+    
+    char proto_str[32], fc_cn_str[32], mod_str[32];
+    snprintf(proto_str, sizeof(proto_str), "Protocol: %s", app->ref_proto_name);
+    snprintf(fc_cn_str, sizeof(fc_cn_str), "FC: %u  CN: %lu", app->ref_fc, app->ref_cn);
+    
+    const char* mod_names[] = {"Auto (LF+NFC)", "ASK (125k)", "PSK (125k)", "NFC (13.56M)"};
+    snprintf(mod_str, sizeof(mod_str), "Mode: %s (locked)", mod_names[app->ref_mod_type]);
+    
+    canvas_draw_str(canvas, 4, 26, proto_str);
+    canvas_draw_str(canvas, 4, 38, fc_cn_str);
+    canvas_draw_str(canvas, 4, 50, mod_str);
+    
+    canvas_draw_str_aligned(canvas, 64, 62, AlignCenter, AlignBottom, "[ OK ]");
+}
 
-    /* Determine new card number based on mode */
-    uint16_t new_cn = orig_cn;
-    switch(app->card_num_mode) {
-        case CardNumMode_Preserve:
-            new_cn = orig_cn;
+static void app_draw_ready(Canvas* canvas, BulkWriterApp* app) {
+    canvas_clear(canvas);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str_aligned(canvas, 64, 12, AlignCenter, AlignTop, "Bulk Writer Enhanced");
+    
+    canvas_set_font(canvas, FontSecondary);
+    
+    char status_str[32];
+    const char* mod_names[] = {"Auto", "ASK", "PSK", "NFC"};
+    snprintf(status_str, sizeof(status_str), "%s | FC: %u | Cards: %u", 
+             mod_names[app->mod_select], app->target_fc, app->cards_written);
+    
+    canvas_draw_str_aligned(canvas, 64, 28, AlignCenter, AlignCenter, status_str);
+    canvas_draw_str_aligned(canvas, 64, 40, AlignCenter, AlignCenter, "Place card on reader");
+    
+    canvas_draw_str(canvas, 2, 62, "[Stop]");
+}
+
+static void app_draw_processing(Canvas* canvas, BulkWriterApp* app) {
+    canvas_clear(canvas);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str_aligned(canvas, 64, 20, AlignCenter, AlignCenter, "Processing...");
+    
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str_aligned(canvas, 64, 35, AlignCenter, AlignCenter, "Modifying card data");
+    canvas_draw_str_aligned(canvas, 64, 47, AlignCenter, AlignCenter, "Please wait");
+}
+
+static void app_draw_result(Canvas* canvas, BulkWriterApp* app) {
+    canvas_clear(canvas);
+    
+    if(app->current_screen == Screen_Success) {
+        canvas_set_font(canvas, FontPrimary);
+        canvas_draw_str_aligned(canvas, 64, 20, AlignCenter, AlignCenter, "SUCCESS!");
+        
+        canvas_set_font(canvas, FontSecondary);
+        char msg[32];
+        snprintf(msg, sizeof(msg), "Card #%u written", app->cards_written);
+        canvas_draw_str_aligned(canvas, 64, 35, AlignCenter, AlignCenter, msg);
+        
+    } else { // Screen_Error
+        canvas_set_font(canvas, FontPrimary);
+        canvas_draw_str_aligned(canvas, 64, 15, AlignCenter, AlignCenter, "ERROR");
+        
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str_aligned(canvas, 64, 30, AlignCenter, AlignCenter, app->error_msg);
+        canvas_draw_str_aligned(canvas, 64, 42, AlignCenter, AlignCenter, "Try again");
+    }
+}
+
+static void app_draw_summary(Canvas* canvas, BulkWriterApp* app) {
+    canvas_clear(canvas);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str_aligned(canvas, 64, 12, AlignCenter, AlignTop, "Session Summary");
+    
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_line(canvas, 10, 15, 118, 15);
+    
+    char written_str[20], failed_str[20], total_str[20];
+    snprintf(written_str, sizeof(written_str), "Written: %u", app->cards_written);
+    snprintf(failed_str, sizeof(failed_str), "Failed: %u", app->cards_failed);
+    snprintf(total_str, sizeof(total_str), "Total: %u", app->cards_written + app->cards_failed);
+    
+    canvas_draw_str(canvas, 20, 28, written_str);
+    canvas_draw_str(canvas, 20, 40, failed_str);
+    canvas_draw_str(canvas, 20, 52, total_str);
+    
+    canvas_draw_str_aligned(canvas, 64, 62, AlignCenter, AlignBottom, "[ OK ]");
+}
+/* ══════════════════════════════════════════════════════════════════════════════
+ *  INPUT HANDLING & MAIN DRAW CALLBACK
+ * ══════════════════════════════════════════════════════════════════════════════ */
+
+static void input_callback(InputEvent* input_event, void* context) {
+    furi_assert(context);
+    BulkWriterApp* app = context;
+    
+    if(input_event->type != InputTypePress) return;
+    
+    switch(app->current_screen) {
+        case Screen_Config:
+            switch(input_event->key) {
+                case InputKeyUp:
+                    if(app->config_cursor > 0) app->config_cursor--;
+                    break;
+                case InputKeyDown:
+                    if(app->config_cursor < 2) app->config_cursor++; // 3 fields: FC, CN, Mod
+                    break;
+                case InputKeyLeft:
+                    switch(app->config_cursor) {
+                        case 0: // FC
+                            if(app->target_fc > FC_MIN) app->target_fc--;
+                            break;
+                        case 1: // Card number mode
+                            if(app->card_num_mode > 0) app->card_num_mode--;
+                            break;
+                        case 2: // Modulation/Reader type
+                            if(app->mod_select > 0) app->mod_select--;
+                            break;
+                    }
+                    break;
+                case InputKeyRight:
+                    switch(app->config_cursor) {
+                        case 0: // FC
+                            if(app->target_fc < FC_MAX) app->target_fc++;
+                            break;
+                        case 1: // Card number mode
+                            if(app->card_num_mode < CardNumMode_COUNT - 1) app->card_num_mode++;
+                            break;
+                        case 2: // Modulation or Reference Scan
+                            if(app->mod_select < Mod_COUNT - 1) {
+                                app->mod_select++;
+                            } else {
+                                // "Scan >" - Start reference scan
+                                app->current_screen = Screen_RefScan;
+                                app->ref_scanned = false;
+                                
+                                // Start appropriate worker based on current mod setting
+                                if(app->mod_select == Mod_NFC) {
+                                    nfc_worker_start(app->nfc_worker, NfcWorkerStateRead, NULL, nfc_read_callback, app);
+                                } else if(app->mod_select == Mod_Auto) {
+                                    // Start both for auto mode
+                                    lfrfid_worker_start_thread(app->lfrfid_worker);
+                                    lfrfid_worker_read_start(app->lfrfid_worker, LFRFIDWorkerReadTypeAuto, lfrfid_read_callback, app);
+                                    nfc_worker_start(app->nfc_worker, NfcWorkerStateRead, NULL, nfc_read_callback, app);
+                                } else {
+                                    // LF modes (ASK/PSK)
+                                    LFRFIDWorkerReadType read_type = (app->mod_select == Mod_ASK) ? 
+                                                                   LFRFIDWorkerReadTypeASKOnly : LFRFIDWorkerReadTypePSKOnly;
+                                    lfrfid_worker_start_thread(app->lfrfid_worker);
+                                    lfrfid_worker_read_start(app->lfrfid_worker, read_type, lfrfid_read_callback, app);
+                                }
+                            }
+                            break;
+                    }
+                    break;
+                case InputKeyOk:
+                    // Start bulk processing
+                    app->current_screen = Screen_Ready;
+                    app->running = true;
+                    app->cards_written = 0;
+                    app->cards_failed = 0;
+                    
+                    // Start readers based on modulation setting
+                    if(app->mod_select == Mod_NFC) {
+                        nfc_worker_start(app->nfc_worker, NfcWorkerStateRead, NULL, nfc_read_callback, app);
+                    } else if(app->mod_select == Mod_Auto) {
+                        // Auto mode - start both LF and NFC
+                        lfrfid_worker_start_thread(app->lfrfid_worker);
+                        lfrfid_worker_read_start(app->lfrfid_worker, LFRFIDWorkerReadTypeAuto, lfrfid_read_callback, app);
+                        nfc_worker_start(app->nfc_worker, NfcWorkerStateRead, NULL, nfc_read_callback, app);
+                    } else {
+                        // LF modes (ASK/PSK)
+                        LFRFIDWorkerReadType read_type;
+                        if(app->ref_scanned && (app->ref_mod_type == Mod_ASK || app->ref_mod_type == Mod_PSK)) {
+                            // Use locked modulation from reference scan
+                            read_type = (app->ref_mod_type == Mod_ASK) ? LFRFIDWorkerReadTypeASKOnly : LFRFIDWorkerReadTypePSKOnly;
+                        } else {
+                            read_type = (app->mod_select == Mod_ASK) ? LFRFIDWorkerReadTypeASKOnly : LFRFIDWorkerReadTypePSKOnly;
+                        }
+                        
+                        lfrfid_worker_start_thread(app->lfrfid_worker);
+                        lfrfid_worker_read_start(app->lfrfid_worker, read_type, lfrfid_read_callback, app);
+                    }
+                    break;
+                case InputKeyBack:
+                    // Exit app
+                    view_port_enabled_set(app->view_port, false);
+                    break;
+                default:
+                    break;
+            }
             break;
-        case CardNumMode_Sequential:
-            new_cn = app->next_sequential++;
+            
+        case Screen_RefScan:
+            if(input_event->key == InputKeyBack || input_event->key == InputKeyLeft) {
+                // Stop scanning and return to config
+                lfrfid_worker_stop(app->lfrfid_worker);
+                lfrfid_worker_stop_thread(app->lfrfid_worker);
+                nfc_worker_stop(app->nfc_worker);
+                app->current_screen = Screen_Config;
+            }
             break;
-        case CardNumMode_Fixed:
-            new_cn = app->card_num_base;
+            
+        case Screen_RefResult:
+            if(input_event->key == InputKeyOk || input_event->key == InputKeyBack) {
+                app->current_screen = Screen_Config;
+            }
             break;
+            
+        case Screen_Ready:
+        case Screen_Reading:
+        case Screen_Processing:
+            if(input_event->key == InputKeyBack || input_event->key == InputKeyLeft) {
+                // Stop processing and show summary
+                app->running = false;
+                lfrfid_worker_stop(app->lfrfid_worker);
+                lfrfid_worker_stop_thread(app->lfrfid_worker);
+                nfc_worker_stop(app->nfc_worker);
+                app->current_screen = Screen_Summary;
+            }
+            break;
+            
+        case Screen_Success:
+        case Screen_Error:
+            // Auto-resume after brief display - no user input needed
+            break;
+            
+        case Screen_Summary:
+            if(input_event->key == InputKeyOk || input_event->key == InputKeyBack) {
+                app->current_screen = Screen_Config;
+            }
+            break;
+            
         default:
             break;
     }
-
-    /* Encode with new FC and CN */
-    bool encoded = false;
-    uint8_t write_data[16];
-    memcpy(write_data, app->last_data, app->last_data_size);
-
-    if(is_hid) {
-        encoded = hid_h10301_encode(write_data, app->last_data_size, app->facility_code, new_cn);
-    } else {
-        encoded = em4100_encode(write_data, app->last_data_size, app->facility_code, new_cn);
-    }
-
-    if(!encoded) {
-        FURI_LOG_E(TAG, "Encoding failed");
-        return false;
-    }
-
-    FURI_LOG_I(TAG, "New: FC=%d CN=%d", app->facility_code, new_cn);
-
-    /* Load encoded data into protocol dict and start write */
-    protocol_dict_set_data(app->protocol_dict, app->last_protocol, write_data, app->last_data_size);
-    app->worker_busy = true;
-    lfrfid_worker_write_start(app->lf_worker, app->last_protocol, lfrfid_write_callback, app);
-
-    return true;
+    
+    save_settings(app);
 }
 
-/**
- * Get the LFRFIDWorkerReadType based on current modulation config.
- * If a reference card was scanned, use its learned read type for speed.
- * Otherwise fall back to the manual mod_select setting.
- */
-static LFRFIDWorkerReadType app_get_read_type(BulkWriterApp* app) {
-    if(app->ref_scanned) {
-        return app->ref_read_type;
-    }
-    switch(app->mod_select) {
-        case Mod_ASK: return LFRFIDWorkerReadTypeASKOnly;
-        case Mod_PSK: return LFRFIDWorkerReadTypePSKOnly;
-        default:      return LFRFIDWorkerReadTypeAuto;
-    }
-}
-
-/**
- * Start the read→write processing loop.
- * Uses locked modulation type for faster reads when configured.
- */
-static void app_start_processing(BulkWriterApp* app) {
-    app->running = true;
-    app->current_screen = Screen_Ready;
-    LFRFIDWorkerReadType read_type = app_get_read_type(app);
-    lfrfid_worker_read_start(app->lf_worker, read_type, lfrfid_read_callback, app);
-
-    const char* type_names[] = {"Auto", "ASK", "PSK"};
-    FURI_LOG_I(TAG, "Processing started — read type: %s", type_names[read_type]);
-}
-
-/** Stop the processing loop */
-static void app_stop_processing(BulkWriterApp* app) {
-    app->running = false;
-    lfrfid_worker_stop(app->lf_worker);
-    FURI_LOG_I(TAG, "Processing stopped");
-}
-
-/* ══════════════════════════════════════════════════════════════════════════════
- *  DRAW CALLBACKS
- * ══════════════════════════════════════════════════════════════════════════════ */
-
-static void app_draw_callback(Canvas* canvas, void* context) {
+static void draw_callback(Canvas* canvas, void* context) {
+    furi_assert(context);
     BulkWriterApp* app = context;
-    canvas_clear(canvas);
-
+    
     switch(app->current_screen) {
         case Screen_Config:
             app_draw_config(canvas, app);
@@ -579,10 +749,10 @@ static void app_draw_callback(Canvas* canvas, void* context) {
             app_draw_ref_result(canvas, app);
             break;
         case Screen_Ready:
-        case Screen_Reading:
             app_draw_ready(canvas, app);
             break;
-        case Screen_Writing:
+        case Screen_Reading:
+        case Screen_Processing:
             app_draw_processing(canvas, app);
             break;
         case Screen_Success:
@@ -592,562 +762,378 @@ static void app_draw_callback(Canvas* canvas, void* context) {
         case Screen_Summary:
             app_draw_summary(canvas, app);
             break;
-    }
-}
-
-/** Config screen — edit FC, card number mode, modulation, scan reference */
-static void app_draw_config(Canvas* canvas, BulkWriterApp* app) {
-    canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str(canvas, 2, 12, "Bulk Writer Setup");
-    canvas_draw_line(canvas, 0, 15, 128, 15);
-
-    canvas_set_font(canvas, FontSecondary);
-    char buf[48];
-    uint8_t y = 27;
-    uint8_t row = 0;
-
-    /* Row 0: Facility Code */
-    snprintf(buf, sizeof(buf), "FC: %d", app->facility_code);
-    canvas_draw_str(canvas, 4, y, buf);
-    if(app->config_cursor == row) {
-        canvas_draw_str(canvas, 0, y, ">");
-        canvas_draw_str(canvas, 100, y, "<L/R>");
-    }
-    row++; y += 10;
-
-    /* Row 1: Card Number Mode */
-    const char* mode_names[] = {"Preserve", "Sequential", "Fixed"};
-    snprintf(buf, sizeof(buf), "CN: %s", mode_names[app->card_num_mode]);
-    canvas_draw_str(canvas, 4, y, buf);
-    if(app->config_cursor == row) {
-        canvas_draw_str(canvas, 0, y, ">");
-        canvas_draw_str(canvas, 100, y, "<L/R>");
-    }
-    row++; y += 10;
-
-    /* Row 2 (conditional): Card number base */
-    if(app->card_num_mode != CardNumMode_Preserve) {
-        snprintf(buf, sizeof(buf), "Base#: %d", app->card_num_base);
-        canvas_draw_str(canvas, 4, y, buf);
-        if(app->config_cursor == row) {
-            canvas_draw_str(canvas, 0, y, ">");
-            canvas_draw_str(canvas, 100, y, "<L/R>");
-        }
-        row++; y += 10;
-    }
-
-    /* Row N: Modulation — or show reference scan result */
-    if(app->ref_scanned) {
-        snprintf(buf, sizeof(buf), "Ref: %s", app->ref_proto_name);
-        canvas_draw_str(canvas, 4, y, buf);
-        if(app->config_cursor == row) {
-            canvas_draw_str(canvas, 0, y, ">");
-            canvas_draw_str(canvas, 90, y, "Rescan>");
-        }
-    } else {
-        const char* mod_names[] = {"Auto", "ASK", "PSK"};
-        snprintf(buf, sizeof(buf), "Mod: %s", mod_names[app->mod_select]);
-        canvas_draw_str(canvas, 4, y, buf);
-        if(app->config_cursor == row) {
-            canvas_draw_str(canvas, 0, y, ">");
-            canvas_draw_str(canvas, 90, y, "Scan >");
-        }
-    }
-
-    /* Footer */
-    elements_button_center(canvas, "Start");
-    elements_button_right(canvas, "Scan");
-}
-
-/** Reference scan screen — waiting for reference card */
-static void app_draw_ref_scan(Canvas* canvas, BulkWriterApp* app) {
-    UNUSED(app);
-    canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str_aligned(canvas, 64, 12, AlignCenter, AlignCenter, "Scan Reference Card");
-
-    canvas_set_font(canvas, FontSecondary);
-    canvas_draw_str_aligned(canvas, 64, 30, AlignCenter, AlignCenter, "Place a sample card");
-    canvas_draw_str_aligned(canvas, 64, 42, AlignCenter, AlignCenter, "on the reader...");
-
-    elements_button_left(canvas, "Cancel");
-}
-
-/** Reference scan result screen */
-static void app_draw_ref_result(Canvas* canvas, BulkWriterApp* app) {
-    canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str_aligned(canvas, 64, 10, AlignCenter, AlignCenter, "Reference Detected!");
-
-    canvas_set_font(canvas, FontSecondary);
-    char buf[48];
-
-    snprintf(buf, sizeof(buf), "Protocol: %s", app->ref_proto_name);
-    canvas_draw_str_aligned(canvas, 64, 26, AlignCenter, AlignCenter, buf);
-
-    snprintf(buf, sizeof(buf), "FC: %d  CN: %d", app->ref_fc, app->ref_cn);
-    canvas_draw_str_aligned(canvas, 64, 38, AlignCenter, AlignCenter, buf);
-
-    const char* mod = (app->ref_read_type == LFRFIDWorkerReadTypeASKOnly) ? "ASK" : "PSK";
-    snprintf(buf, sizeof(buf), "Modulation: %s (locked)", mod);
-    canvas_draw_str_aligned(canvas, 64, 50, AlignCenter, AlignCenter, buf);
-
-    elements_button_center(canvas, "OK");
-}
-
-/** Ready/Reading screen — waiting for card */
-static void app_draw_ready(Canvas* canvas, BulkWriterApp* app) {
-    canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str_aligned(canvas, 64, 8, AlignCenter, AlignCenter, "Bulk Writer");
-
-    canvas_set_font(canvas, FontSecondary);
-
-    char buf[40];
-    snprintf(buf, sizeof(buf), "FC: %d  |  Cards: %d", app->facility_code, app->cards_written);
-    canvas_draw_str_aligned(canvas, 64, 24, AlignCenter, AlignCenter, buf);
-
-    if(app->current_screen == Screen_Reading) {
-        canvas_draw_str_aligned(canvas, 64, 38, AlignCenter, AlignCenter, "Reading tag...");
-    } else {
-        canvas_draw_str_aligned(canvas, 64, 38, AlignCenter, AlignCenter, "Place card on reader");
-    }
-
-    if(app->cards_failed > 0) {
-        snprintf(buf, sizeof(buf), "Failed: %d", app->cards_failed);
-        canvas_draw_str_aligned(canvas, 64, 50, AlignCenter, AlignCenter, buf);
-    }
-
-    elements_button_left(canvas, "Stop");
-}
-
-/** Writing in progress screen */
-static void app_draw_processing(Canvas* canvas, BulkWriterApp* app) {
-    UNUSED(app);
-    canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str_aligned(canvas, 64, 26, AlignCenter, AlignCenter, "Writing...");
-    canvas_set_font(canvas, FontSecondary);
-    canvas_draw_str_aligned(canvas, 64, 42, AlignCenter, AlignCenter, "Keep card on reader");
-}
-
-/** Success or error flash */
-static void app_draw_result(Canvas* canvas, BulkWriterApp* app) {
-    canvas_set_font(canvas, FontPrimary);
-
-    if(app->current_screen == Screen_Success) {
-        canvas_draw_str_aligned(canvas, 64, 26, AlignCenter, AlignCenter, "OK!");
-        canvas_set_font(canvas, FontSecondary);
-        char buf[32];
-        snprintf(buf, sizeof(buf), "Card #%d written", app->cards_written);
-        canvas_draw_str_aligned(canvas, 64, 42, AlignCenter, AlignCenter, buf);
-    } else {
-        canvas_draw_str_aligned(canvas, 64, 26, AlignCenter, AlignCenter, "WRITE FAILED");
-        canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str_aligned(canvas, 64, 42, AlignCenter, AlignCenter, "Check card is T5577");
-    }
-}
-
-/** Session summary screen */
-static void app_draw_summary(Canvas* canvas, BulkWriterApp* app) {
-    canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str(canvas, 2, 12, "Session Summary");
-    canvas_draw_line(canvas, 0, 15, 128, 15);
-
-    canvas_set_font(canvas, FontSecondary);
-    char buf[40];
-
-    snprintf(buf, sizeof(buf), "Written: %d", app->cards_written);
-    canvas_draw_str(canvas, 4, 28, buf);
-
-    snprintf(buf, sizeof(buf), "Failed:  %d", app->cards_failed);
-    canvas_draw_str(canvas, 4, 40, buf);
-
-    snprintf(buf, sizeof(buf), "FC used: %d", app->facility_code);
-    canvas_draw_str(canvas, 4, 52, buf);
-
-    elements_button_center(canvas, "OK");
-}
-
-/* ══════════════════════════════════════════════════════════════════════════════
- *  INPUT CALLBACK
- * ══════════════════════════════════════════════════════════════════════════════ */
-
-static void app_input_callback(InputEvent* input_event, void* context) {
-    BulkWriterApp* app = context;
-    furi_message_queue_put(app->event_queue, input_event, FuriWaitForever);
-}
-
-/* ══════════════════════════════════════════════════════════════════════════════
- *  INPUT HANDLING — CONFIG SCREEN
- * ══════════════════════════════════════════════════════════════════════════════ */
-
-static void app_handle_config_input(BulkWriterApp* app, InputEvent* event) {
-    if(event->type != InputTypePress && event->type != InputTypeRepeat) return;
-
-    /* Calculate max cursor position based on visible fields */
-    uint8_t max_cursor = (app->card_num_mode != CardNumMode_Preserve) ? 3 : 2;
-    /* The last row is always the modulation / reference scan row */
-    uint8_t mod_row = max_cursor;
-
-    switch(event->key) {
-        case InputKeyUp:
-            if(app->config_cursor > 0) app->config_cursor--;
-            break;
-
-        case InputKeyDown:
-            if(app->config_cursor < max_cursor) app->config_cursor++;
-            break;
-
-        case InputKeyLeft:
-        case InputKeyRight: {
-            int8_t dir = (event->key == InputKeyRight) ? 1 : -1;
-
-            if(app->config_cursor == 0) {
-                /* Facility Code: 0-255 */
-                int16_t new_fc = (int16_t)app->facility_code + dir;
-                if(new_fc < FC_MIN) new_fc = FC_MAX;
-                if(new_fc > FC_MAX) new_fc = FC_MIN;
-                app->facility_code = (uint8_t)new_fc;
-
-            } else if(app->config_cursor == 1) {
-                /* Card Number Mode */
-                int8_t new_mode = (int8_t)app->card_num_mode + dir;
-                if(new_mode < 0) new_mode = CardNumMode_COUNT - 1;
-                if(new_mode >= (int8_t)CardNumMode_COUNT) new_mode = 0;
-                app->card_num_mode = (CardNumMode)new_mode;
-
-            } else if(app->config_cursor == 2 && app->card_num_mode != CardNumMode_Preserve) {
-                /* Card number base: 0-65535 */
-                int32_t new_base = (int32_t)app->card_num_base + dir;
-                if(new_base < 0) new_base = 65535;
-                if(new_base > 65535) new_base = 0;
-                app->card_num_base = (uint16_t)new_base;
-
-            } else if(app->config_cursor == mod_row) {
-                if(event->key == InputKeyRight) {
-                    /* Right on mod row = start reference scan */
-                    app->current_screen = Screen_RefScan;
-                    lfrfid_worker_read_start(
-                        app->lf_worker, LFRFIDWorkerReadTypeAuto,
-                        lfrfid_ref_scan_callback, app);
-                } else {
-                    /* Left on mod row = cycle modulation (clears ref scan) */
-                    app->ref_scanned = false;
-                    int8_t new_mod = (int8_t)app->mod_select - 1;
-                    if(new_mod < 0) new_mod = Mod_COUNT - 1;
-                    app->mod_select = (ModSelect)new_mod;
-                }
-            }
-            break;
-        }
-
-        case InputKeyOk:
-            /* Start processing */
-            app->next_sequential = app->card_num_base;
-            app_start_processing(app);
-            break;
-
-        case InputKeyBack:
-            /* Will be caught by main loop to exit app */
-            break;
-
         default:
             break;
     }
 }
 
 /* ══════════════════════════════════════════════════════════════════════════════
- *  INPUT HANDLING — PROCESSING SCREENS
+ *  NOTIFICATION HELPERS
  * ══════════════════════════════════════════════════════════════════════════════ */
 
-static void app_handle_processing_input(BulkWriterApp* app, InputEvent* event) {
-    if(event->type != InputTypePress) return;
-
-    switch(event->key) {
-        case InputKeyLeft:
-        case InputKeyBack:
-            /* Stop processing, show summary */
-            app_stop_processing(app);
-            app->current_screen = Screen_Summary;
-            break;
-        default:
-            break;
-    }
+static void play_success_sound(BulkWriterApp* app) {
+    // Ascending beep sequence for success
+    notification_message(app->notifications, &sequence_success);
 }
 
+static void play_failure_sound(BulkWriterApp* app) {
+    // Descending buzz sequence for failure
+    notification_message(app->notifications, &sequence_error);
+}
+
+static void show_success_led(BulkWriterApp* app) {
+    notification_message(app->notifications, &sequence_set_green_255);
+    notification_message(app->notifications, &sequence_delay_50);
+    notification_message(app->notifications, &sequence_reset_green);
+}
+
+static void show_failure_led(BulkWriterApp* app) {
+    notification_message(app->notifications, &sequence_set_red_255);
+    notification_message(app->notifications, &sequence_delay_50);
+    notification_message(app->notifications, &sequence_reset_red);
+}
+
+static void show_processing_led(BulkWriterApp* app) {
+    notification_message(app->notifications, &sequence_set_blue_255);
+    notification_message(app->notifications, &sequence_delay_25);
+    notification_message(app->notifications, &sequence_reset_blue);
+}
 /* ══════════════════════════════════════════════════════════════════════════════
- *  PERSISTENT SETTINGS (same pattern as ClayLoop)
- *
- *  Settings saved to /ext/apps_data/bulk_writer/config.ff using FlipperFormat.
- *  Called at app exit. Loaded at startup to override defaults.
+ *  SETTINGS PERSISTENCE
  * ══════════════════════════════════════════════════════════════════════════════ */
 
-static void app_save_settings(BulkWriterApp* app) {
+static void save_settings(BulkWriterApp* app) {
     Storage* storage = furi_record_open(RECORD_STORAGE);
-
-    /* Ensure directory exists */
+    
+    // Ensure config directory exists
     storage_simply_mkdir(storage, BULKWRITER_CONFIG_DIR);
-
-    FlipperFormat* ff = flipper_format_file_alloc(storage);
-
-    do {
-        if(!flipper_format_file_open_always(ff, BULKWRITER_CONFIG_PATH)) {
-            FURI_LOG_E(TAG, "Failed to open config for writing");
-            break;
+    
+    FlipperFormat* file = flipper_format_file_alloc(storage);
+    
+    if(flipper_format_file_open_new(file, BULKWRITER_CONFIG_PATH)) {
+        flipper_format_write_header_cstr(file, "BulkWriter Enhanced Config", 2);
+        flipper_format_write_uint32(file, "TargetFC", &app->target_fc, 1);
+        flipper_format_write_uint32(file, "TargetCN", &app->target_cn, 1);
+        flipper_format_write_uint32(file, "CardNumMode", (uint32_t*)&app->card_num_mode, 1);
+        flipper_format_write_uint32(file, "ModSelect", (uint32_t*)&app->mod_select, 1);
+        flipper_format_write_bool(file, "RefScanned", &app->ref_scanned, 1);
+        
+        if(app->ref_scanned) {
+            flipper_format_write_uint32(file, "RefModType", (uint32_t*)&app->ref_mod_type, 1);
+            flipper_format_write_uint32(file, "RefLFRFIDProtocol", (uint32_t*)&app->ref_lfrfid_protocol, 1);
+            flipper_format_write_uint32(file, "RefNFCProtocol", (uint32_t*)&app->ref_nfc_protocol, 1);
+            flipper_format_write_string_cstr(file, "RefProtoName", app->ref_proto_name);
+            flipper_format_write_uint32(file, "RefFC", (uint32_t*)&app->ref_fc, 1);
+            flipper_format_write_uint32(file, "RefCN", &app->ref_cn, 1);
         }
-
-        flipper_format_write_header_cstr(ff, "BulkWriter Config", 1);
-
-        uint32_t fc = app->facility_code;
-        uint32_t mode = app->card_num_mode;
-        uint32_t base = app->card_num_base;
-        uint32_t mod = app->mod_select;
-        uint32_t verify = app->verify_after_write ? 1 : 0;
-
-        flipper_format_write_uint32(ff, "FacilityCode", &fc, 1);
-        flipper_format_write_uint32(ff, "CardNumMode", &mode, 1);
-        flipper_format_write_uint32(ff, "CardNumBase", &base, 1);
-        flipper_format_write_uint32(ff, "Modulation", &mod, 1);
-        flipper_format_write_uint32(ff, "VerifyWrite", &verify, 1);
-
-        FURI_LOG_I(TAG, "Settings saved (FC=%lu mode=%lu base=%lu mod=%lu)",
-            fc, mode, base, mod);
-    } while(false);
-
-    flipper_format_free(ff);
+    }
+    
+    flipper_format_file_close(file);
+    flipper_format_free(file);
     furi_record_close(RECORD_STORAGE);
 }
 
-static void app_load_settings(BulkWriterApp* app) {
+static void load_settings(BulkWriterApp* app) {
     Storage* storage = furi_record_open(RECORD_STORAGE);
-    FlipperFormat* ff = flipper_format_file_alloc(storage);
-
-    do {
-        if(!flipper_format_file_open_existing(ff, BULKWRITER_CONFIG_PATH)) {
-            FURI_LOG_I(TAG, "No saved config found, using defaults");
-            break;
-        }
-
+    FlipperFormat* file = flipper_format_file_alloc(storage);
+    
+    // Set defaults
+    app->target_fc = FC_DEFAULT;
+    app->target_cn = CARD_NUM_DEFAULT;
+    app->card_num_mode = CARD_NUM_MODE_DEFAULT;
+    app->mod_select = MOD_DEFAULT;
+    app->ref_scanned = false;
+    
+    if(flipper_format_file_open_existing(file, BULKWRITER_CONFIG_PATH)) {
         FuriString* header = furi_string_alloc();
-        uint32_t version = 0;
-        bool header_ok = flipper_format_read_header(ff, header, &version);
+        uint32_t version;
+        
+        if(flipper_format_read_header(file, header, &version)) {
+            uint32_t temp_value;
+            
+            if(flipper_format_read_uint32(file, "TargetFC", &temp_value, 1)) {
+                app->target_fc = temp_value;
+            }
+            if(flipper_format_read_uint32(file, "TargetCN", &app->target_cn, 1)) {
+                // Loaded
+            }
+            if(flipper_format_read_uint32(file, "CardNumMode", &temp_value, 1)) {
+                app->card_num_mode = temp_value;
+            }
+            if(flipper_format_read_uint32(file, "ModSelect", &temp_value, 1)) {
+                app->mod_select = temp_value;
+            }
+            if(flipper_format_read_bool(file, "RefScanned", &app->ref_scanned, 1) && app->ref_scanned) {
+                flipper_format_read_uint32(file, "RefModType", (uint32_t*)&app->ref_mod_type, 1);
+                flipper_format_read_uint32(file, "RefLFRFIDProtocol", (uint32_t*)&app->ref_lfrfid_protocol, 1);
+                flipper_format_read_uint32(file, "RefNFCProtocol", (uint32_t*)&app->ref_nfc_protocol, 1);
+                flipper_format_read_string_cstr(file, "RefProtoName", app->ref_proto_name, sizeof(app->ref_proto_name));
+                flipper_format_read_uint32(file, "RefFC", (uint32_t*)&app->ref_fc, 1);
+                flipper_format_read_uint32(file, "RefCN", &app->ref_cn, 1);
+            }
+        }
+        
         furi_string_free(header);
-        if(!header_ok) break;
-
-        uint32_t val;
-
-        if(flipper_format_read_uint32(ff, "FacilityCode", &val, 1)) {
-            if(val <= FC_MAX) app->facility_code = (uint8_t)val;
-        }
-        if(flipper_format_read_uint32(ff, "CardNumMode", &val, 1)) {
-            if(val < CardNumMode_COUNT) app->card_num_mode = (CardNumMode)val;
-        }
-        if(flipper_format_read_uint32(ff, "CardNumBase", &val, 1)) {
-            if(val <= 65535) app->card_num_base = (uint16_t)val;
-        }
-        if(flipper_format_read_uint32(ff, "Modulation", &val, 1)) {
-            if(val < Mod_COUNT) app->mod_select = (ModSelect)val;
-        }
-        if(flipper_format_read_uint32(ff, "VerifyWrite", &val, 1)) {
-            app->verify_after_write = (val != 0);
-        }
-
-        FURI_LOG_I(TAG, "Settings loaded (FC=%d mode=%d base=%d mod=%d)",
-            app->facility_code, app->card_num_mode, app->card_num_base, app->mod_select);
-    } while(false);
-
-    flipper_format_free(ff);
+    }
+    
+    flipper_format_file_close(file);
+    flipper_format_free(file);
     furi_record_close(RECORD_STORAGE);
 }
 
 /* ══════════════════════════════════════════════════════════════════════════════
- *  ALLOC / FREE (same lifecycle as ClayLoop)
+ *  APPLICATION LIFECYCLE
  * ══════════════════════════════════════════════════════════════════════════════ */
 
-static BulkWriterApp* app_alloc(void) {
+static BulkWriterApp* bulk_writer_app_alloc() {
     BulkWriterApp* app = malloc(sizeof(BulkWriterApp));
-    memset(app, 0, sizeof(BulkWriterApp));
-
-    /* Set defaults before loading persisted values */
-    app->facility_code = FC_DEFAULT;
-    app->card_num_mode = CARD_NUM_MODE_DEFAULT;
-    app->card_num_base = CARD_NUM_DEFAULT;
-    app->mod_select = MOD_DEFAULT;
-    app->verify_after_write = true;
-    app->current_screen = Screen_Config;
-    app->config_cursor = 0;
-    app->ref_scanned = false;
-
-    /* Override defaults from SD card config */
-    app_load_settings(app);
-
-    /* Reset runtime counters */
-    app->next_sequential = app->card_num_base;
-    app->cards_written = 0;
-    app->cards_failed = 0;
-
-    /* GUI setup */
+    
+    // Initialize core components
     app->gui = furi_record_open(RECORD_GUI);
     app->notifications = furi_record_open(RECORD_NOTIFICATION);
-    app->event_queue = furi_message_queue_alloc(8, sizeof(InputEvent));
-
+    app->event_queue = furi_message_queue_alloc(8, sizeof(AppEvent));
+    
+    // Initialize LFRFID components
+    app->lfrfid_worker = lfrfid_worker_alloc();
+    app->lfrfid_protocol_dict = protocol_dict_alloc(lfrfid_protocols, LFRFIDProtocolMax);
+    
+    // Initialize NFC components
+    app->nfc = nfc_alloc();
+    app->nfc_worker = nfc_worker_alloc(app->nfc);
+    
+    // Setup ViewPort
     app->view_port = view_port_alloc();
-    view_port_draw_callback_set(app->view_port, app_draw_callback, app);
-    view_port_input_callback_set(app->view_port, app_input_callback, app);
+    view_port_draw_callback_set(app->view_port, draw_callback, app);
+    view_port_input_callback_set(app->view_port, input_callback, app);
     gui_add_view_port(app->gui, app->view_port, GuiLayerFullscreen);
-
-    /* LFRFID subsystem */
-    app->protocol_dict = protocol_dict_alloc(lfrfid_protocols, LFRFIDProtocolMax);
-    app->lf_worker = lfrfid_worker_alloc(app->protocol_dict);
-    lfrfid_worker_start_thread(app->lf_worker);
-
-    FURI_LOG_I(TAG, "App allocated, FC=%d", app->facility_code);
+    
+    // Initialize state
+    app->current_screen = Screen_Config;
+    app->config_cursor = 0;
+    app->running = false;
+    app->cards_written = 0;
+    app->cards_failed = 0;
+    
+    // Load settings
+    load_settings(app);
+    
     return app;
 }
 
-static void app_free(BulkWriterApp* app) {
-    FURI_LOG_I(TAG, "Cleaning up...");
-
-    /* Save settings before teardown */
-    app_save_settings(app);
-
-    /* Stop LFRFID worker */
-    if(app->running) {
-        lfrfid_worker_stop(app->lf_worker);
+static void bulk_writer_app_free(BulkWriterApp* app) {
+    furi_assert(app);
+    
+    // Stop any active workers
+    if(app->lfrfid_worker) {
+        lfrfid_worker_stop(app->lfrfid_worker);
+        lfrfid_worker_stop_thread(app->lfrfid_worker);
+        lfrfid_worker_free(app->lfrfid_worker);
     }
-    lfrfid_worker_stop_thread(app->lf_worker);
-    lfrfid_worker_free(app->lf_worker);
-    protocol_dict_free(app->protocol_dict);
-
-    /* GUI teardown */
-    view_port_enabled_set(app->view_port, false);
-    gui_remove_view_port(app->gui, app->view_port);
-    view_port_free(app->view_port);
-    furi_message_queue_free(app->event_queue);
-
-    furi_record_close(RECORD_GUI);
-    furi_record_close(RECORD_NOTIFICATION);
-
+    
+    if(app->nfc_worker) {
+        nfc_worker_stop(app->nfc_worker);
+        nfc_worker_free(app->nfc_worker);
+    }
+    
+    if(app->nfc) {
+        nfc_free(app->nfc);
+    }
+    
+    // Cleanup protocol dictionary
+    if(app->lfrfid_protocol_dict) {
+        protocol_dict_free(app->lfrfid_protocol_dict);
+    }
+    
+    // Cleanup GUI
+    if(app->gui && app->view_port) {
+        gui_remove_view_port(app->gui, app->view_port);
+        view_port_free(app->view_port);
+        furi_record_close(RECORD_GUI);
+    }
+    
+    // Cleanup notifications
+    if(app->notifications) {
+        furi_record_close(RECORD_NOTIFICATION);
+    }
+    
+    // Cleanup message queue
+    if(app->event_queue) {
+        furi_message_queue_free(app->event_queue);
+    }
+    
     free(app);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+ *  MAIN PROCESSING LOOP
+ * ══════════════════════════════════════════════════════════════════════════════ */
+
+static void process_read_card(BulkWriterApp* app) {
+    app->current_screen = Screen_Processing;
+    show_processing_led(app);
+    
+    uint8_t orig_fc = 0;
+    uint32_t orig_cn = 0;
+    bool extract_success = false;
+    bool inject_success = false;
+    
+    // Determine active reader and extract data
+    if(app->active_reader == ReaderType_NFC) {
+        extract_success = extract_nfc_data(app->last_nfc_protocol, app->last_data, app->last_data_size, &orig_fc, &orig_cn);
+    } else {
+        // LFRFID
+        const char* protocol_name = protocol_dict_get_name(app->lfrfid_protocol_dict, app->last_lfrfid_protocol);
+        
+        if(strcmp(protocol_name, "H10301") == 0) {
+            extract_success = extract_hid_h10301(app->last_data, app->last_data_size, &orig_fc, &orig_cn);
+        } else if(strcmp(protocol_name, "EM4100") == 0) {
+            extract_success = extract_em4100(app->last_data, app->last_data_size, &orig_fc, &orig_cn);
+        }
+    }
+    
+    if(!extract_success) {
+        snprintf(app->error_msg, sizeof(app->error_msg), "Unsupported protocol");
+        app->current_screen = Screen_Error;
+        show_failure_led(app);
+        play_failure_sound(app);
+        app->cards_failed++;
+        return;
+    }
+    
+    // Calculate new card number based on mode
+    uint32_t new_cn = orig_cn;
+    switch(app->card_num_mode) {
+        case CardNumMode_Preserve:
+            // Keep original
+            break;
+        case CardNumMode_Sequential:
+            new_cn = app->target_cn + app->cards_written;
+            break;
+        case CardNumMode_Fixed:
+            new_cn = app->target_cn;
+            break;
+    }
+    
+    // Inject new data
+    if(app->active_reader == ReaderType_NFC) {
+        inject_success = inject_nfc_data(app->last_nfc_protocol, app->last_data, app->last_data_size, app->target_fc, new_cn);
+    } else {
+        // LFRFID
+        const char* protocol_name = protocol_dict_get_name(app->lfrfid_protocol_dict, app->last_lfrfid_protocol);
+        
+        if(strcmp(protocol_name, "H10301") == 0) {
+            inject_success = inject_hid_h10301(app->last_data, app->last_data_size, app->target_fc, new_cn);
+        } else if(strcmp(protocol_name, "EM4100") == 0) {
+            inject_success = inject_em4100(app->last_data, app->last_data_size, app->target_fc, new_cn);
+        }
+    }
+    
+    if(!inject_success) {
+        snprintf(app->error_msg, sizeof(app->error_msg), "Data injection failed");
+        app->current_screen = Screen_Error;
+        show_failure_led(app);
+        play_failure_sound(app);
+        app->cards_failed++;
+        return;
+    }
+    
+    // Write back to card
+    bool write_success = false;
+    if(app->active_reader == ReaderType_NFC) {
+        // NFC write (simplified - actual implementation would depend on NFC API)
+        write_success = nfc_worker_write(app->nfc_worker, app->last_data, app->last_data_size);
+    } else {
+        // LFRFID write
+        protocol_dict_set_data(app->lfrfid_protocol_dict, app->last_lfrfid_protocol, app->last_data, app->last_data_size);
+        write_success = lfrfid_worker_write_start(app->lfrfid_worker, app->last_lfrfid_protocol);
+    }
+    
+    if(write_success) {
+        app->cards_written++;
+        app->current_screen = Screen_Success;
+        show_success_led(app);
+        play_success_sound(app);
+    } else {
+        snprintf(app->error_msg, sizeof(app->error_msg), "Write failed");
+        app->current_screen = Screen_Error;
+        show_failure_led(app);
+        play_failure_sound(app);
+        app->cards_failed++;
+    }
+    
+    // Auto-resume after delay
+    furi_delay_ms(1500);
+    if(app->running) {
+        app->current_screen = Screen_Ready;
+    }
 }
 
 /* ══════════════════════════════════════════════════════════════════════════════
  *  MAIN ENTRY POINT
  * ══════════════════════════════════════════════════════════════════════════════ */
 
-int32_t bulk_writer_app(void* p) {
+int32_t bulk_writer_enhanced_app(void* p) {
     UNUSED(p);
-
-    BulkWriterApp* app = app_alloc();
-    InputEvent event;
-    bool exit_requested = false;
-
-    while(!exit_requested) {
-        FuriStatus status = furi_message_queue_get(app->event_queue, &event, 100);
-
-        if(status == FuriStatusOk) {
-            /* Internal signal from LFRFID callbacks (key = InputKeyMAX) */
-            if(event.key == InputKeyMAX) {
-
-                if(app->current_screen == Screen_RefScan) {
-                    /* Reference scan completed — stop worker, show result */
-                    lfrfid_worker_stop(app->lf_worker);
-                    beep_success();
-                    app->current_screen = Screen_RefResult;
-
-                } else if(app->current_screen == Screen_Success ||
-                   app->current_screen == Screen_Error) {
-                    /* Fire LED + audible notification */
-                    if(app->current_screen == Screen_Success) {
-                        notification_message(app->notifications, &seq_success);
-                        beep_success();
-                        view_port_update(app->view_port);
-                        furi_delay_ms(800);
-                    } else {
-                        notification_message(app->notifications, &seq_error);
-                        beep_error();
-                        view_port_update(app->view_port);
-                        furi_delay_ms(1200);
-                    }
-
-                    /*
-                     * AUTO-RESUME: always return to reading after
-                     * both success AND failure — no user input required.
-                     * Uses locked read type for speed when configured.
-                     */
-                    if(app->running) {
-                        app->current_screen = Screen_Ready;
-                        LFRFIDWorkerReadType read_type = app_get_read_type(app);
-                        lfrfid_worker_read_start(
-                            app->lf_worker, read_type,
-                            lfrfid_read_callback, app);
-                    }
-                } else {
-                    /* Tag was read during bulk processing — process it */
-                    lfrfid_worker_stop(app->lf_worker);
-                    notification_message(app->notifications, &seq_reading);
-                    app->current_screen = Screen_Writing;
-                    view_port_update(app->view_port);
-                    notification_message(app->notifications, &seq_writing);
-
-                    if(!app_process_tag(app)) {
-                        app->cards_failed++;
-                        app->current_screen = Screen_Error;
-                        app->worker_busy = false;
-                        /* Re-trigger to show error */
-                        InputEvent err_event = {.type = InputTypePress, .key = InputKeyMAX};
-                        furi_message_queue_put(app->event_queue, &err_event, 0);
-                    }
-                }
-            } else {
-                /* Real user input */
-                switch(app->current_screen) {
-                    case Screen_Config:
-                        if(event.key == InputKeyBack && event.type == InputTypePress) {
-                            exit_requested = true;
+    
+    BulkWriterApp* app = bulk_writer_app_alloc();
+    
+    AppEvent event;
+    while(1) {
+        if(furi_message_queue_get(app->event_queue, &event, 100) == FuriStatusOk) {
+            switch(event.type) {
+                case EventTypeRead:
+                    if(app->current_screen == Screen_RefScan) {
+                        // Reference scan complete
+                        app->ref_scanned = true;
+                        app->ref_reader_type = app->active_reader;
+                        
+                        // Extract reference data
+                        if(app->active_reader == ReaderType_NFC) {
+                            app->ref_nfc_protocol = app->last_nfc_protocol;
+                            snprintf(app->ref_proto_name, sizeof(app->ref_proto_name), "NFC Protocol");
+                            extract_nfc_data(app->ref_nfc_protocol, app->last_data, app->last_data_size, &app->ref_fc, &app->ref_cn);
                         } else {
-                            app_handle_config_input(app, &event);
+                            app->ref_lfrfid_protocol = app->last_lfrfid_protocol;
+                            const char* protocol_name = protocol_dict_get_name(app->lfrfid_protocol_dict, app->ref_lfrfid_protocol);
+                            strncpy(app->ref_proto_name, protocol_name, sizeof(app->ref_proto_name) - 1);
+                            
+                            if(strcmp(protocol_name, "H10301") == 0) {
+                                extract_hid_h10301(app->last_data, app->last_data_size, &app->ref_fc, &app->ref_cn);
+                            } else if(strcmp(protocol_name, "EM4100") == 0) {
+                                extract_em4100(app->last_data, app->last_data_size, &app->ref_fc, &app->ref_cn);
+                            }
                         }
-                        break;
-
-                    case Screen_RefScan:
-                        /* Cancel reference scan */
-                        if(event.type == InputTypePress &&
-                           (event.key == InputKeyBack || event.key == InputKeyLeft)) {
-                            lfrfid_worker_stop(app->lf_worker);
-                            app->current_screen = Screen_Config;
-                        }
-                        break;
-
-                    case Screen_RefResult:
-                        /* Acknowledge reference result → back to config */
-                        if(event.type == InputTypePress &&
-                           (event.key == InputKeyOk || event.key == InputKeyBack)) {
-                            app->current_screen = Screen_Config;
-                        }
-                        break;
-
-                    case Screen_Ready:
-                    case Screen_Reading:
-                    case Screen_Writing:
-                    case Screen_Success:
-                    case Screen_Error:
-                        app_handle_processing_input(app, &event);
-                        break;
-
-                    case Screen_Summary:
-                        if(event.type == InputTypePress &&
-                           (event.key == InputKeyOk || event.key == InputKeyBack)) {
-                            /* Return to config for another batch */
-                            app->current_screen = Screen_Config;
-                            app->cards_written = 0;
-                            app->cards_failed = 0;
-                        }
-                        break;
-                }
+                        
+                        // Stop workers and show result
+                        lfrfid_worker_stop(app->lfrfid_worker);
+                        lfrfid_worker_stop_thread(app->lfrfid_worker);
+                        nfc_worker_stop(app->nfc_worker);
+                        app->current_screen = Screen_RefResult;
+                        
+                    } else if(app->current_screen == Screen_Ready && app->running) {
+                        // Card read during bulk processing
+                        process_read_card(app);
+                    }
+                    break;
+                    
+                case EventTypeExit:
+                    goto exit_app;
+                    
+                default:
+                    break;
             }
         }
-
+        
+        // Check if ViewPort is disabled (user pressed Back to exit)
+        if(!view_port_is_enabled(app->view_port)) {
+            break;
+        }
+        
         view_port_update(app->view_port);
     }
-
-    app_free(app);
+    
+exit_app:
+    save_settings(app);
+    bulk_writer_app_free(app);
     return 0;
 }
