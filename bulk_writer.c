@@ -448,9 +448,16 @@ static void lfrfid_ref_scan_callback(LFRFIDWorkerReadResult result, ProtocolId p
     }
 }
 
-/** Called by LFRFID worker when a write completes */
+/** Called by LFRFID worker when a write completes.
+ *  The write worker keeps running (retransmitting) until explicitly stopped,
+ *  so this callback may fire multiple times. We use worker_busy as a
+ *  one-shot gate to process only the first result per write cycle. */
 static void lfrfid_write_callback(LFRFIDWorkerWriteResult result, void* context) {
     BulkWriterApp* app = context;
+
+    /* Only process the first callback per write — ignore subsequent retransmits */
+    if(!app->worker_busy) return;
+    app->worker_busy = false;
 
     if(result == LFRFIDWorkerWriteOK) {
         app->cards_written++;
@@ -461,7 +468,6 @@ static void lfrfid_write_callback(LFRFIDWorkerWriteResult result, void* context)
         app->current_screen = Screen_Error;
         FURI_LOG_E(TAG, "Write FAIL: total_fail=%d", app->cards_failed);
     }
-    app->worker_busy = false;
 
     /* Signal main loop to update display */
     InputEvent event = {.type = InputTypePress, .key = InputKeyMAX};
@@ -1116,11 +1122,12 @@ int32_t bulk_writer_app(void* p) {
                     }
 
                     /*
-                     * AUTO-RESUME: always return to reading after
-                     * both success AND failure ΓÇö no user input required.
-                     * Uses locked read type for speed when configured.
+                     * AUTO-RESUME: stop the write worker (it keeps
+                     * retransmitting until stopped), then restart the
+                     * reader for the next card.
                      */
                     if(app->running) {
+                        lfrfid_worker_stop(app->lf_worker);
                         app->current_screen = Screen_Ready;
                         LFRFIDWorkerReadType read_type = app_get_read_type(app);
                         lfrfid_worker_read_start(
