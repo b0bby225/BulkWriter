@@ -66,25 +66,16 @@ typedef enum {
 #define CARD_NUM_DEFAULT      0
 #define CARD_NUM_MODE_DEFAULT CardNumMode_Preserve
 
-/** Modulation selection — determines LFRFIDWorkerReadType (LF only) */
+/** Modulation / reader selection */
 typedef enum {
-    Mod_Auto = 0, /** Auto-detect (slowest — cycles ASK+PSK) */
-    Mod_ASK,      /** ASK only (HID, EM4100, most common) */
-    Mod_PSK,      /** PSK only (Indala, AWID, etc.) */
+    Mod_Auto = 0, /** LF Auto-detect (slowest — cycles ASK+PSK) */
+    Mod_ASK,      /** LF ASK only (HID, EM4100, most common) */
+    Mod_PSK,      /** LF PSK only (Indala, AWID, etc.) */
+    Mod_NFC,      /** NFC 13.56MHz (NTAG, Mifare Classic) */
     Mod_COUNT
 } ModSelect;
 
 #define MOD_DEFAULT Mod_Auto
-
-/** V2 Reader type — which antenna/protocol to use */
-typedef enum {
-    ReaderType_Auto = 0, /** Auto-detect: try LF first, then NFC */
-    ReaderType_LF,       /** 125kHz LF RFID only */
-    ReaderType_NFC,      /** 13.56MHz NFC only */
-    ReaderType_COUNT
-} ReaderType;
-
-#define READER_TYPE_DEFAULT ReaderType_Auto
 
 /** Max cards we track in session stats */
 #define MAX_LOG_ENTRIES 999
@@ -147,7 +138,6 @@ typedef struct {
     CardNumMode card_num_mode;
     uint16_t card_num_base;
     ModSelect mod_select;
-    ReaderType reader_type;
 
     /* Config screen cursor */
     uint8_t config_cursor;
@@ -752,8 +742,7 @@ static void app_start_processing(BulkWriterV2App* app) {
     app->running = true;
     app->current_screen = Screen_Ready;
 
-    bool use_nfc = (app->reader_type == ReaderType_NFC) ||
-                   (app->reader_type == ReaderType_Auto && app->ref_scanned && app->ref_is_nfc);
+    bool use_nfc = (app->mod_select == Mod_NFC);
 
     if(use_nfc) {
         /* NFC mode */
@@ -779,8 +768,7 @@ static void app_resume_processing(BulkWriterV2App* app) {
     if(!app->running) return;
     app->current_screen = Screen_Ready;
 
-    bool use_nfc = (app->reader_type == ReaderType_NFC) ||
-                   (app->reader_type == ReaderType_Auto && app->ref_scanned && app->ref_is_nfc);
+    bool use_nfc = (app->mod_select == Mod_NFC);
 
     if(use_nfc) {
         app_start_nfc_op(app, NfcOp_ReadAndWrite);
@@ -866,48 +854,17 @@ static void app_draw_config(Canvas* canvas, BulkWriterV2App* app) {
         row++; y += 10;
     }
 
-    /* Row N: Reader type */
-    const char* reader_names[] = {"Auto", "LF 125kHz", "NFC 13.56MHz"};
-    snprintf(buf, sizeof(buf), "Reader: %s", reader_names[app->reader_type]);
-    canvas_draw_str(canvas, 4, y, buf);
-    if(app->config_cursor == row) {
-        canvas_draw_str(canvas, 0, y, ">");
-        canvas_draw_str(canvas, 100, y, "<L/R>");
-    }
-    row++; y += 10;
-
-    /* Row N+1: Modulation / reference (only for LF modes) */
-    if(app->reader_type != ReaderType_NFC) {
-        if(app->ref_scanned && !app->ref_is_nfc) {
-            snprintf(buf, sizeof(buf), "Ref: %s", app->ref_proto_name);
-            canvas_draw_str(canvas, 4, y, buf);
-            if(app->config_cursor == row) {
-                canvas_draw_str(canvas, 0, y, ">");
-                canvas_draw_str(canvas, 90, y, "Rescan>");
-            }
-        } else if(app->ref_scanned && app->ref_is_nfc) {
-            snprintf(buf, sizeof(buf), "Ref: %s", app->ref_proto_name);
-            canvas_draw_str(canvas, 4, y, buf);
-            if(app->config_cursor == row) {
-                canvas_draw_str(canvas, 0, y, ">");
-                canvas_draw_str(canvas, 90, y, "Rescan>");
-            }
-        } else {
-            const char* mod_names[] = {"Auto", "ASK", "PSK"};
-            snprintf(buf, sizeof(buf), "Mod: %s", mod_names[app->mod_select]);
-            canvas_draw_str(canvas, 4, y, buf);
-            if(app->config_cursor == row) {
-                canvas_draw_str(canvas, 0, y, ">");
-                canvas_draw_str(canvas, 90, y, "Scan >");
-            }
+    /* Row N: Modulation / NFC / reference */
+    if(app->ref_scanned) {
+        snprintf(buf, sizeof(buf), "Ref: %s", app->ref_proto_name);
+        canvas_draw_str(canvas, 4, y, buf);
+        if(app->config_cursor == row) {
+            canvas_draw_str(canvas, 0, y, ">");
+            canvas_draw_str(canvas, 90, y, "Rescan>");
         }
     } else {
-        /* NFC-only mode: show NFC reference if available */
-        if(app->ref_scanned && app->ref_is_nfc) {
-            snprintf(buf, sizeof(buf), "Ref: %s", app->ref_proto_name);
-        } else {
-            snprintf(buf, sizeof(buf), "NFC: Scan ref >");
-        }
+        const char* mod_names[] = {"Auto", "ASK", "PSK", "NFC"};
+        snprintf(buf, sizeof(buf), "Mod: %s", mod_names[app->mod_select]);
         canvas_draw_str(canvas, 4, y, buf);
         if(app->config_cursor == row) {
             canvas_draw_str(canvas, 0, y, ">");
@@ -927,8 +884,7 @@ static void app_draw_ref_scan(Canvas* canvas, BulkWriterV2App* app) {
 
     canvas_set_font(canvas, FontSecondary);
 
-    bool nfc_mode = (app->reader_type == ReaderType_NFC);
-    if(nfc_mode) {
+    if(app->mod_select == Mod_NFC) {
         canvas_draw_str_aligned(canvas, 64, 28, AlignCenter, AlignCenter, "Place NFC card");
         canvas_draw_str_aligned(canvas, 64, 40, AlignCenter, AlignCenter, "on the reader...");
     } else {
@@ -976,9 +932,7 @@ static void app_draw_ready(Canvas* canvas, BulkWriterV2App* app) {
     canvas_draw_str_aligned(canvas, 64, 22, AlignCenter, AlignCenter, buf);
 
     /* Reader type indicator */
-    bool use_nfc = (app->reader_type == ReaderType_NFC) ||
-                   (app->reader_type == ReaderType_Auto && app->ref_scanned && app->ref_is_nfc);
-    if(use_nfc) {
+    if(app->mod_select == Mod_NFC) {
         canvas_draw_str_aligned(canvas, 64, 33, AlignCenter, AlignCenter, "[NFC 13.56MHz]");
     } else {
         canvas_draw_str_aligned(canvas, 64, 33, AlignCenter, AlignCenter, "[LF 125kHz]");
@@ -1026,9 +980,7 @@ static void app_draw_result(Canvas* canvas, BulkWriterV2App* app) {
     } else {
         canvas_draw_str_aligned(canvas, 64, 22, AlignCenter, AlignCenter, "WRITE FAILED");
         canvas_set_font(canvas, FontSecondary);
-        bool use_nfc = (app->reader_type == ReaderType_NFC) ||
-                       (app->ref_scanned && app->ref_is_nfc);
-        if(use_nfc) {
+        if(app->mod_select == Mod_NFC) {
             canvas_draw_str_aligned(canvas, 64, 38, AlignCenter, AlignCenter, "Check NFC card is writable");
         } else {
             canvas_draw_str_aligned(canvas, 64, 38, AlignCenter, AlignCenter, "Check card is T5577");
@@ -1073,10 +1025,9 @@ static void app_input_callback(InputEvent* input_event, void* context) {
 static void app_handle_config_input(BulkWriterV2App* app, InputEvent* event) {
     if(event->type != InputTypePress && event->type != InputTypeRepeat) return;
 
-    /* Calculate max cursor: FC, CN, [Base#], Reader, Mod/Ref */
-    uint8_t max_cursor = (app->card_num_mode != CardNumMode_Preserve) ? 4 : 3;
+    /* Calculate max cursor: FC, CN, [Base#], Mod/Ref */
+    uint8_t max_cursor = (app->card_num_mode != CardNumMode_Preserve) ? 3 : 2;
     uint8_t base_row = (app->card_num_mode != CardNumMode_Preserve) ? 2 : 255;
-    uint8_t reader_row = (app->card_num_mode != CardNumMode_Preserve) ? 3 : 2;
     uint8_t mod_row = max_cursor;
 
     switch(event->key) {
@@ -1113,20 +1064,12 @@ static void app_handle_config_input(BulkWriterV2App* app, InputEvent* event) {
                 if(new_base > 65535) new_base = 0;
                 app->card_num_base = (uint16_t)new_base;
 
-            } else if(app->config_cursor == reader_row) {
-                /* Reader type */
-                int8_t new_rt = (int8_t)app->reader_type + dir;
-                if(new_rt < 0) new_rt = ReaderType_COUNT - 1;
-                if(new_rt >= (int8_t)ReaderType_COUNT) new_rt = 0;
-                app->reader_type = (ReaderType)new_rt;
-
             } else if(app->config_cursor == mod_row) {
                 if(event->key == InputKeyRight) {
                     /* Right = start reference scan */
-                    bool nfc_ref = (app->reader_type == ReaderType_NFC);
                     app->current_screen = Screen_RefScan;
 
-                    if(nfc_ref) {
+                    if(app->mod_select == Mod_NFC) {
                         /* NFC reference scan */
                         app_start_nfc_op(app, NfcOp_RefScan);
                     } else {
@@ -1136,8 +1079,8 @@ static void app_handle_config_input(BulkWriterV2App* app, InputEvent* event) {
                             lfrfid_ref_scan_callback, app);
                     }
                 } else {
-                    /* Left = cycle modulation (clears LF ref) */
-                    if(!app->ref_is_nfc) app->ref_scanned = false;
+                    /* Left = cycle modulation (clears ref) */
+                    app->ref_scanned = false;
                     int8_t new_mod = (int8_t)app->mod_select - 1;
                     if(new_mod < 0) new_mod = Mod_COUNT - 1;
                     app->mod_select = (ModSelect)new_mod;
@@ -1197,16 +1140,14 @@ static void app_save_settings(BulkWriterV2App* app) {
         uint32_t mode = app->card_num_mode;
         uint32_t base = app->card_num_base;
         uint32_t mod = app->mod_select;
-        uint32_t rt = app->reader_type;
 
         flipper_format_write_uint32(ff, "FacilityCode", &fc, 1);
         flipper_format_write_uint32(ff, "CardNumMode", &mode, 1);
         flipper_format_write_uint32(ff, "CardNumBase", &base, 1);
         flipper_format_write_uint32(ff, "Modulation", &mod, 1);
-        flipper_format_write_uint32(ff, "ReaderType", &rt, 1);
 
-        FURI_LOG_I(TAG, "Settings saved (FC=%lu mode=%lu base=%lu mod=%lu reader=%lu)",
-            fc, mode, base, mod, rt);
+        FURI_LOG_I(TAG, "Settings saved (FC=%lu mode=%lu base=%lu mod=%lu)",
+            fc, mode, base, mod);
     } while(false);
 
     flipper_format_free(ff);
@@ -1243,13 +1184,10 @@ static void app_load_settings(BulkWriterV2App* app) {
         if(flipper_format_read_uint32(ff, "Modulation", &val, 1)) {
             if(val < Mod_COUNT) app->mod_select = (ModSelect)val;
         }
-        if(flipper_format_read_uint32(ff, "ReaderType", &val, 1)) {
-            if(val < ReaderType_COUNT) app->reader_type = (ReaderType)val;
-        }
 
-        FURI_LOG_I(TAG, "Settings loaded (FC=%d mode=%d base=%d mod=%d reader=%d)",
+        FURI_LOG_I(TAG, "Settings loaded (FC=%d mode=%d base=%d mod=%d)",
             app->facility_code, app->card_num_mode, app->card_num_base,
-            app->mod_select, app->reader_type);
+            app->mod_select);
     } while(false);
 
     flipper_format_free(ff);
@@ -1269,7 +1207,6 @@ static BulkWriterV2App* app_alloc(void) {
     app->card_num_mode = CARD_NUM_MODE_DEFAULT;
     app->card_num_base = CARD_NUM_DEFAULT;
     app->mod_select = MOD_DEFAULT;
-    app->reader_type = READER_TYPE_DEFAULT;
     app->current_screen = Screen_Config;
     app->config_cursor = 0;
     app->ref_scanned = false;
@@ -1305,7 +1242,7 @@ static BulkWriterV2App* app_alloc(void) {
     app->nfc = nfc_alloc();
     app->nfc_thread = furi_thread_alloc_ex("BWv2NFC", 4 * 1024, nfc_operation_thread, app);
 
-    FURI_LOG_I(TAG, "V2 App allocated, FC=%d reader=%d", app->facility_code, app->reader_type);
+    FURI_LOG_I(TAG, "V2 App allocated, FC=%d mod=%d", app->facility_code, app->mod_select);
     return app;
 }
 
