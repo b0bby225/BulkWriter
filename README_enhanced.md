@@ -58,17 +58,33 @@ The compiled `.fap` will be in `dist/bulk_writer_enhanced.fap`.
 
 | Screen | Controls |
 |---|---|
-| **Setup** | Up/Down = navigate, Left/Right = adjust |
-| **Setup - Reader** | Select LF (125kHz), NFC (13.56MHz), or Auto |
-| **Setup - Modulation** | Right on Mod row = Scan Reference Card (LF only) |
+| **Setup** | Up/Down = navigate fields, Left/Right = adjust values |
+| **Setup - Mod** | Right on Mod row = Scan Reference Card |
 | **Processing** | Left/Back = Stop and show summary |
 | **Summary** | OK/Back = New batch |
 
-## 🔄 Reader Types Explained
+## 🔧 Streamlined Setup Screen
 
-- **LF (125k)** - Low Frequency 125kHz RFID only (HID, EM4100, etc.)
-- **NFC (13.56M)** - Near Field Communication 13.56MHz only (NTAG, Mifare, etc.)  
-- **Auto** - Tries both LF and NFC protocols automatically (slower but comprehensive)
+The enhanced setup screen has been streamlined to 3 essential fields:
+
+1. **FC** - Facility Code (0-255)
+2. **CN** - Card Number Mode (Preserve/Sequential/Fixed)
+3. **Mod** - Unified Modulation/Reader Selection:
+   - **Auto (LF+NFC)** - Tries both 125kHz and 13.56MHz protocols automatically
+   - **ASK (125k)** - Low Frequency ASK modulation only (HID H10301, EM4100, most common)
+   - **PSK (125k)** - Low Frequency PSK modulation only (Indala, AWID, less common)
+The **Mod** field eliminates the need for separate reader type selection by combining both protocol and modulation into one unified option. Navigate with Left/Right arrows or use "Scan >" to auto-detect the optimal setting for your cards.
+
+## 🔧 Modulation Options Explained
+
+| Option | Description | Use When |
+|---|---|---|
+| **Auto (LF+NFC)** | Tries both 125kHz LF and 13.56MHz NFC protocols | Mixed card types, unsure of protocol, maximum compatibility |
+| **ASK (125k)** | Low Frequency ASK modulation only | HID ProxCard, EM4100, most common LF cards |
+| **PSK (125k)** | Low Frequency PSK modulation only | Indala, AWID, specific PSK-based cards |
+| **NFC (13.56M)** | Near Field Communication 13.56MHz only | NTAG213/215/216, Mifare Classic, modern cards |
+
+**Pro Tip:** Use reference scanning (Right arrow on Mod field) to automatically detect and lock the optimal modulation for faster subsequent processing!
 
 ## 🎯 Usage Workflow
 
@@ -76,11 +92,10 @@ The compiled `.fap` will be in `dist/bulk_writer_enhanced.fap`.
 2. **Configure Settings:**
    - Set your target Facility Code (0-255)
    - Choose Card Number mode (Preserve/Sequential/Fixed)
-   - Select Reader Type (LF/NFC/Auto)
-   - For LF: Choose Modulation (Auto/ASK/PSK)
+   - Select Modulation: Auto (LF+NFC)/ASK (125k)/PSK (125k)/NFC (13.56M)
 3. **(Recommended)** Scan Reference Card:
    - Navigate to Mod row and press Right
-   - Place a sample card to auto-detect protocol and lock reader
+   - Place a sample card to auto-detect protocol and lock modulation
 4. Press OK to start bulk processing
 5. Place cards on the reader one at a time
 6. Listen for protocol-specific feedback:
@@ -91,11 +106,12 @@ The compiled `.fap` will be in `dist/bulk_writer_enhanced.fap`.
 ## 🚧 What's New in v2.0
 
 - ✅ **Full NFC Support** - 13.56MHz cards (NTAG, Mifare)
-- ✅ **Reader Type Selection** - LF/NFC/Auto modes in Setup screen
+- ✅ **Unified Modulation Field** - Single field handles both protocol and modulation selection
+- ✅ **Streamlined 3-Field Setup** - FC, Card Number Mode, Modulation (no redundant fields)
 - ✅ **Protocol Auto-Detection** - Automatically identifies card types
 - ✅ **Enhanced Reference Scan** - Detects both LF and NFC protocols
 - ✅ **Expanded Protocol Support** - All major RFID protocols
-- ✅ **Improved UI** - Reader type shown in setup and processing screens
+- ✅ **Improved UI** - Cleaner, more intuitive setup flow
 - ✅ **Better Error Handling** - Protocol-specific error messages
 
 ## 📋 Requirements
