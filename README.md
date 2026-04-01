@@ -22,18 +22,12 @@ Bulk-program T5577 125kHz cards with a preset facility code. Designed for hands-
 **Note:** Factory HID ProxII and genuine EM4100 cards are read-only. This app only works with T5577-based rewritable cards.
 ## Installation
 
-### Method 1: Flipper App Store (Recommended)
-1. Open the Flipper Mobile App
-2. Go to **Hub** → **Apps**
-3. Search for "Bulk Writer"
-4. Tap **Install**
-
-### Method 2: Pre-built FAP Download
+### Method 1: Pre-built FAP Download
 1. Download `bulk_writer.fap` from the [dist/](dist/) folder
 2. Copy to your SD card: `SD Card/apps/RFID/bulk_writer.fap`
 3. Refresh apps on your Flipper (Applications → Browser → Search)
 
-### Method 3: Build from Source
+### Method 2: Build from Source
 ```bash
 # Install ufbt if you haven't already
 pip install ufbt
