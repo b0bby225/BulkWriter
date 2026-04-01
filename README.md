@@ -18,8 +18,11 @@ Bulk-program 125kHz RFID cards with preset facility codes. Designed for hands-fr
 |---|---|---|---|
 | **HID H10301** | 26-bit (8-bit FC + 16-bit CN) | T5577 blanks | ASK |
 | **EM4100** | 40-bit (8-bit FC + 32-bit ID) | T5577 blanks | ASK |
-| **Indala** | 64-bit | T5577 blanks | PSK |
-| **AWID** | 50-bit | T5577 blanks | PSK |
+| **Indala26** | 26-bit (8-bit FC + 16-bit CN, scattered bits) | T5577 blanks | PSK |
+| **AWID** | 26-bit (8-bit FC + 16-bit CN, Wiegand parity) | T5577 blanks | PSK |
+| **IoProxXSF** | 26-bit (8-bit FC + 16-bit CN) | T5577 blanks | PSK |
+| **Pyramid** | 26-bit (8-bit FC + 16-bit CN) | T5577 blanks | PSK |
+| **Paradox** | 26-bit (8-bit FC + 16-bit CN, CRC checksum) | T5577 blanks | PSK |
 
 **Note:** Factory HID ProxII and genuine EM4100 cards are read-only. This app only works with T5577-based rewritable LF cards.
 
@@ -75,7 +78,7 @@ The compiled `.fap` will be in `dist/bulk_writer.fap`.
 
 - **Auto** — Tries both ASK and PSK (slowest, maximum compatibility)
 - **ASK** — HID H10301, EM4100 cards only (fastest for common cards)
-- **PSK** — Indala, AWID cards only (fastest for PSK cards)
+- **PSK** — Indala, AWID, IoProx, Pyramid, Paradox cards (fastest for PSK cards)
 
 **Pro Tip:** Use reference scanning to auto-detect and lock the optimal modulation for your card batch!
 
