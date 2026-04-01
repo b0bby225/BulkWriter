@@ -60,8 +60,42 @@ typedef enum {
 
 #define MOD_DEFAULT Mod_Auto
 
-/** Max cards we track in session stats */
-#define MAX_LOG_ENTRIES 999
+/** Generic protocol: treat data[0] as FC, data[1..2] or data[3..4] as CN */
+static bool generic_extract(
+    const uint8_t* data,
+    size_t data_size,
+    uint8_t* fc_out,
+    uint16_t* cn_out) {
+    if(data_size < 2) return false;
+    *fc_out = data[0];
+    if(data_size >= 5) {
+        *cn_out = ((uint16_t)data[3] << 8) | data[4];
+    } else if(data_size >= 3) {
+        *cn_out = ((uint16_t)data[1] << 8) | data[2];
+    } else {
+        *cn_out = data[1];
+    }
+    return true;
+}
+
+static bool generic_encode(
+    uint8_t* data,
+    size_t data_size,
+    uint8_t fc,
+    uint16_t cn) {
+    if(data_size < 2) return false;
+    data[0] = fc;
+    if(data_size >= 5) {
+        data[3] = (cn >> 8) & 0xFF;
+        data[4] = cn & 0xFF;
+    } else if(data_size >= 3) {
+        data[1] = (cn >> 8) & 0xFF;
+        data[2] = cn & 0xFF;
+    } else {
+        data[1] = cn & 0xFF;
+    }
+    return true;
+}
 
 /* ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
  *  APPLICATION SCREENS (state machine ΓÇö same pattern as ClayLoop)
@@ -401,13 +435,15 @@ static void lfrfid_ref_scan_callback(LFRFIDWorkerReadResult result, ProtocolId p
             app->ref_read_type = LFRFIDWorkerReadTypePSKOnly;
         }
 
-        /* Extract FC/CN for display */
+        /* Extract FC/CN for display — use protocol name, not data_size */
         app->ref_fc = 0;
         app->ref_cn = 0;
-        if(data_size == 3) {
+        if(strstr(app->ref_proto_name, "H10301")) {
             hid_h10301_extract(data, data_size, &app->ref_fc, &app->ref_cn);
-        } else if(data_size >= 5) {
+        } else if(strstr(app->ref_proto_name, "EM4100") || strstr(app->ref_proto_name, "EM410")) {
             em4100_extract(data, data_size, &app->ref_fc, &app->ref_cn);
+        } else {
+            generic_extract(data, data_size, &app->ref_fc, &app->ref_cn);
         }
 
         FURI_LOG_I(TAG, "Reference scan: %s, FC=%d CN=%d, read_type=%d",
@@ -455,21 +491,32 @@ static bool app_process_tag(BulkWriterApp* app) {
     uint8_t orig_fc = 0;
     uint16_t orig_cn = 0;
     bool extracted = false;
-    bool is_hid = false;
 
-    /* Identify protocol and extract fields */
+    /* Identify protocol by name, not data_size */
     const char* proto_name = protocol_dict_get_name(app->protocol_dict, app->last_protocol);
     FURI_LOG_I(TAG, "Processing protocol: %s (data_size=%zu)", proto_name, app->last_data_size);
 
-    /* Try HID H10301 first (3 bytes = 26-bit format) */
-    if(app->last_data_size == 3) {
-        extracted = hid_h10301_extract(app->last_data, app->last_data_size, &orig_fc, &orig_cn);
-        if(extracted) is_hid = true;
+    /* Determine encoding type from protocol name */
+    typedef enum { Enc_HID, Enc_EM4100, Enc_Generic } EncType;
+    EncType enc_type = Enc_Generic;
+
+    if(strstr(proto_name, "H10301")) {
+        enc_type = Enc_HID;
+    } else if(strstr(proto_name, "EM4100") || strstr(proto_name, "EM410")) {
+        enc_type = Enc_EM4100;
     }
 
-    /* Try EM4100 (5 bytes) */
-    if(!extracted && app->last_data_size >= 5) {
-        extracted = em4100_extract(app->last_data, app->last_data_size, &orig_fc, &orig_cn);
+    /* Extract FC/CN using appropriate decoder */
+    switch(enc_type) {
+        case Enc_HID:
+            extracted = hid_h10301_extract(app->last_data, app->last_data_size, &orig_fc, &orig_cn);
+            break;
+        case Enc_EM4100:
+            extracted = em4100_extract(app->last_data, app->last_data_size, &orig_fc, &orig_cn);
+            break;
+        case Enc_Generic:
+            extracted = generic_extract(app->last_data, app->last_data_size, &orig_fc, &orig_cn);
+            break;
     }
 
     if(!extracted) {
@@ -500,10 +547,16 @@ static bool app_process_tag(BulkWriterApp* app) {
     uint8_t write_data[16];
     memcpy(write_data, app->last_data, app->last_data_size);
 
-    if(is_hid) {
-        encoded = hid_h10301_encode(write_data, app->last_data_size, app->facility_code, new_cn);
-    } else {
-        encoded = em4100_encode(write_data, app->last_data_size, app->facility_code, new_cn);
+    switch(enc_type) {
+        case Enc_HID:
+            encoded = hid_h10301_encode(write_data, app->last_data_size, app->facility_code, new_cn);
+            break;
+        case Enc_EM4100:
+            encoded = em4100_encode(write_data, app->last_data_size, app->facility_code, new_cn);
+            break;
+        case Enc_Generic:
+            encoded = generic_encode(write_data, app->last_data_size, app->facility_code, new_cn);
+            break;
     }
 
     if(!encoded) {
@@ -547,8 +600,7 @@ static void app_start_processing(BulkWriterApp* app) {
     LFRFIDWorkerReadType read_type = app_get_read_type(app);
     lfrfid_worker_read_start(app->lf_worker, read_type, lfrfid_read_callback, app);
 
-    const char* type_names[] = {"Auto", "ASK", "PSK"};
-    FURI_LOG_I(TAG, "Processing started ΓÇö read type: %s", type_names[read_type]);
+    FURI_LOG_I(TAG, "Processing started, read_type=%d", read_type);
 }
 
 /** Stop the processing loop */
