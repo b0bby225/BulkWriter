@@ -141,6 +141,7 @@ typedef struct {
 
     /* Config screen cursor */
     uint8_t config_cursor;        /** Which config field is selected */
+    uint16_t repeat_count;        /** Consecutive repeat events for acceleration */
 
     /* Reference scan state */
     bool ref_scanned;              /** True if a reference card was scanned */
@@ -830,6 +831,13 @@ static void app_input_callback(InputEvent* input_event, void* context) {
 static void app_handle_config_input(BulkWriterApp* app, InputEvent* event) {
     if(event->type != InputTypePress && event->type != InputTypeRepeat) return;
 
+    /* Track hold duration for acceleration (~10 repeats/sec on Flipper) */
+    if(event->type == InputTypeRepeat) {
+        app->repeat_count++;
+    } else {
+        app->repeat_count = 0;
+    }
+
     /* Calculate max cursor position based on visible fields */
     uint8_t max_cursor = (app->card_num_mode != CardNumMode_Preserve) ? 3 : 2;
     /* The last row is always the modulation / reference scan row */
@@ -863,8 +871,13 @@ static void app_handle_config_input(BulkWriterApp* app, InputEvent* event) {
                 app->card_num_mode = (CardNumMode)new_mode;
 
             } else if(app->config_cursor == 2 && app->card_num_mode != CardNumMode_Preserve) {
-                /* Card number base: 0-65535 */
-                int32_t new_base = (int32_t)app->card_num_base + dir;
+                /* Card number base: 0-65535 with hold-to-accelerate */
+                int32_t step = 1;
+                if(app->repeat_count > 100) step = 1000;      /* ~10s: +1000 */
+                else if(app->repeat_count > 50) step = 100;    /* ~5s:  +100  */
+                else if(app->repeat_count > 20) step = 10;     /* ~2s:  +10   */
+
+                int32_t new_base = (int32_t)app->card_num_base + dir * step;
                 if(new_base < 0) new_base = 65535;
                 if(new_base > 65535) new_base = 0;
                 app->card_num_base = (uint16_t)new_base;
