@@ -1,10 +1,6 @@
 # Bulk Writer — Flipper Zero Facility Code Tag Reprogrammer
 
-Bulk-program RFID cards with preset facility codes. Designed for hands-free batch processing of access control cards.
-
-**Available Versions:**
-- **v1.0 (this version)** — 125kHz LF RFID only (HID H10301, EM4100, Indala, AWID) 
-- **🚀 v2.0** — Enhanced version with advanced UI, statistics tracking, and improved workflow
+Bulk-program 125kHz RFID cards with preset facility codes. Designed for hands-free batch processing of access control cards.
 
 ## ✨ Features
 
@@ -30,12 +26,10 @@ Bulk-program RFID cards with preset facility codes. Designed for hands-free batc
 ## 🚀 Installation
 
 ### Quick Download (Recommended)
-**Choose your version:**
-- **🔥 V1 Stable (Recommended)**: [bulk_writer.fap](dist/bulk_writer.fap) - Production ready LF RFID support
-- **✨ V2 Enhanced**: [bulk_writer_v2.fap](dist/bulk_writer_v2.fap) - Advanced UI with statistics and enhanced features
+**Download**: [bulk_writer.fap](dist/bulk_writer.fap)
 
 ### Installation Steps
-1. Download the `.fap` file for your preferred version
+1. Download the `.fap` file
 2. Copy to your SD card: `SD Card/apps/RFID/bulk_writer.fap` 
 3. Refresh apps on your Flipper (Applications → Browser → Search)
 
@@ -99,5 +93,3 @@ MIT License — see [LICENSE](LICENSE) for details.
 Bobby Gibbs ([@b0bby225](https://github.com/b0bby225))
 
 ---
-
-**🔥 Looking for NFC support?** Version 2.0 with full multi-protocol support (LF + NFC) is in development!

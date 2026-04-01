@@ -52,10 +52,9 @@ typedef enum {
 
 /** Modulation selection ΓÇö determines LFRFIDWorkerReadType */
 typedef enum {
-    Mod_Auto = 0,    /** Auto-detect (slowest ΓÇö cycles ASK+PSK) */
+    Mod_Auto = 0,    /** Auto-detect (cycles ASK+PSK) */
     Mod_ASK,          /** ASK only (HID, EM4100, most common) */
     Mod_PSK,          /** PSK only (Indala, AWID, etc.) */
-    Mod_NFC,          /** NFC 13.56MHz mode */
     Mod_COUNT
 } ModSelect;
 
@@ -105,7 +104,6 @@ typedef struct {
     CardNumMode card_num_mode;
     uint16_t card_num_base;       /** Base for sequential or fixed value */
     ModSelect mod_select;          /** ASK / PSK / Auto modulation */
-    bool verify_after_write;      /** Read-back verification */
 
     /* Config screen cursor */
     uint8_t config_cursor;        /** Which config field is selected */
@@ -656,7 +654,6 @@ static void app_draw_config(Canvas* canvas, BulkWriterApp* app) {
 
     /* Footer */
     elements_button_center(canvas, "Start");
-    elements_button_right(canvas, "Scan");
 }
 
 /** Reference scan screen ΓÇö waiting for reference card */
@@ -899,13 +896,11 @@ static void app_save_settings(BulkWriterApp* app) {
         uint32_t mode = app->card_num_mode;
         uint32_t base = app->card_num_base;
         uint32_t mod = app->mod_select;
-        uint32_t verify = app->verify_after_write ? 1 : 0;
 
         flipper_format_write_uint32(ff, "FacilityCode", &fc, 1);
         flipper_format_write_uint32(ff, "CardNumMode", &mode, 1);
         flipper_format_write_uint32(ff, "CardNumBase", &base, 1);
         flipper_format_write_uint32(ff, "Modulation", &mod, 1);
-        flipper_format_write_uint32(ff, "VerifyWrite", &verify, 1);
 
         FURI_LOG_I(TAG, "Settings saved (FC=%lu mode=%lu base=%lu mod=%lu)",
             fc, mode, base, mod);
@@ -945,9 +940,6 @@ static void app_load_settings(BulkWriterApp* app) {
         if(flipper_format_read_uint32(ff, "Modulation", &val, 1)) {
             if(val < Mod_COUNT) app->mod_select = (ModSelect)val;
         }
-        if(flipper_format_read_uint32(ff, "VerifyWrite", &val, 1)) {
-            app->verify_after_write = (val != 0);
-        }
 
         FURI_LOG_I(TAG, "Settings loaded (FC=%d mode=%d base=%d mod=%d)",
             app->facility_code, app->card_num_mode, app->card_num_base, app->mod_select);
@@ -970,7 +962,6 @@ static BulkWriterApp* app_alloc(void) {
     app->card_num_mode = CARD_NUM_MODE_DEFAULT;
     app->card_num_base = CARD_NUM_DEFAULT;
     app->mod_select = MOD_DEFAULT;
-    app->verify_after_write = true;
     app->current_screen = Screen_Config;
     app->config_cursor = 0;
     app->ref_scanned = false;
