@@ -1,0 +1,14 @@
+App(
+    appid="bulk_writer_v2",
+    name="Bulk Writer V2",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="bulk_writer_v2_app",
+    requires=["gui", "dialogs", "storage"],
+    stack_size=6 * 1024,  # Increased for future NFC support
+    fap_icon="images/bulk_writer_10px.png",
+    fap_category="RFID",
+    fap_version=(2, 0),
+    fap_description="Multi-protocol RFID facility code reprogrammer. Enhanced version with LF (HID, EM4100, Indala, AWID) and future NFC support.",
+    fap_author="Bobby Gibbs (@b0bby225)",
+    fap_icon_assets="images",
+)
