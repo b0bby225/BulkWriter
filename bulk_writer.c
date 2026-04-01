@@ -171,37 +171,29 @@ typedef struct {
  *  (Same approach as ClayLoop ΓÇö predefined notification_message sequences)
  * ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ */
 
-/** Green blink + short vibro = card written OK */
+/** Green blink + short vibro = card written OK (fast turnaround) */
 static const NotificationSequence seq_success = {
     &message_green_255,
     &message_vibro_on,
-    &message_delay_100,
+    &message_delay_50,
     &message_vibro_off,
-    &message_delay_500,
+    &message_delay_250,
     &message_green_0,
     NULL,
 };
 
-/** Red blink + double vibro = write failed */
+/** Red blink + double vibro = write failed (fast turnaround) */
 static const NotificationSequence seq_error = {
     &message_red_255,
     &message_vibro_on,
-    &message_delay_100,
+    &message_delay_50,
     &message_vibro_off,
     &message_delay_50,
     &message_vibro_on,
-    &message_delay_100,
+    &message_delay_50,
     &message_vibro_off,
-    &message_delay_250,
+    &message_delay_100,
     &message_red_0,
-    NULL,
-};
-
-/** Blue pulse = reading */
-static const NotificationSequence seq_reading = {
-    &message_blue_255,
-    &message_delay_250,
-    &message_blue_0,
     NULL,
 };
 
@@ -224,14 +216,14 @@ static const NotificationSequence seq_writing = {
 
 static void beep_success(void) {
     if(furi_hal_speaker_acquire(100)) {
-        /* First tone: 880 Hz for 100ms */
+        /* First tone: 880 Hz for 60ms */
         furi_hal_speaker_start(880.0f, 1.0f);
-        furi_delay_ms(100);
+        furi_delay_ms(60);
         furi_hal_speaker_stop();
-        furi_delay_ms(50);
-        /* Second tone: 1100 Hz for 100ms */
+        furi_delay_ms(30);
+        /* Second tone: 1100 Hz for 60ms */
         furi_hal_speaker_start(1100.0f, 1.0f);
-        furi_delay_ms(100);
+        furi_delay_ms(60);
         furi_hal_speaker_stop();
         furi_hal_speaker_release();
     }
@@ -239,14 +231,14 @@ static void beep_success(void) {
 
 static void beep_error(void) {
     if(furi_hal_speaker_acquire(100)) {
-        /* First tone: 440 Hz for 150ms */
+        /* First tone: 440 Hz for 80ms */
         furi_hal_speaker_start(440.0f, 1.0f);
-        furi_delay_ms(150);
+        furi_delay_ms(80);
         furi_hal_speaker_stop();
-        furi_delay_ms(50);
-        /* Second tone: 220 Hz for 250ms ΓÇö low buzz */
+        furi_delay_ms(30);
+        /* Second tone: 220 Hz for 120ms ΓÇö low buzz */
         furi_hal_speaker_start(220.0f, 1.0f);
-        furi_delay_ms(250);
+        furi_delay_ms(120);
         furi_hal_speaker_stop();
         furi_hal_speaker_release();
     }
@@ -1110,17 +1102,17 @@ int32_t bulk_writer_app(void* p) {
 
                 } else if(app->current_screen == Screen_Success ||
                    app->current_screen == Screen_Error) {
-                    /* Fire LED + audible notification */
+                    /* Fire LED + audible notification (tight timing for bulk speed) */
                     if(app->current_screen == Screen_Success) {
                         notification_message(app->notifications, &seq_success);
                         beep_success();
                         view_port_update(app->view_port);
-                        furi_delay_ms(800);
+                        furi_delay_ms(300);
                     } else {
                         notification_message(app->notifications, &seq_error);
                         beep_error();
                         view_port_update(app->view_port);
-                        furi_delay_ms(1200);
+                        furi_delay_ms(500);
                     }
 
                     /*
@@ -1138,7 +1130,6 @@ int32_t bulk_writer_app(void* p) {
                 } else {
                     /* Tag was read during bulk processing ΓÇö process it */
                     lfrfid_worker_stop(app->lf_worker);
-                    notification_message(app->notifications, &seq_reading);
                     app->current_screen = Screen_Writing;
                     view_port_update(app->view_port);
                     notification_message(app->notifications, &seq_writing);
