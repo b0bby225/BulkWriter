@@ -1,0 +1,31 @@
+# Build artifacts
+*.o
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+
+# Compiled FAP
+*.fap
+
+# uFBT build directories
+.ufbt/
+build/
+.vscode/compile_commands.json
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# Editors
+*.swp
+*.swo
+*~
+.vscode/
+
+# IDE
+.idea/
+*.sublime-*
