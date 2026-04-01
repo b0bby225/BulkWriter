@@ -23,6 +23,7 @@
 #include <flipper_format/flipper_format.h>
 #include <lib/lfrfid/lfrfid_worker.h>
 #include <lib/lfrfid/protocols/lfrfid_protocols.h>
+#include <lib/bit_lib/bit_lib.h>
 
 #define TAG "BulkWriter"
 
@@ -273,8 +274,9 @@ static LFRFIDWorkerReadType app_get_read_type(BulkWriterApp* app);
 
 /**
  * Extract facility code and card number from HID H10301 26-bit data.
- * Data layout in protocol_dict: 3 bytes = [parity+FC_high] [FC_low+CN_high] [CN_low+parity]
- * Bit layout: P FFFFFFFF CCCCCCCCCCCCCCCC P
+ * Flipper firmware stores decoded H10301 as 3 clean bytes:
+ *   data[0] = FC,  data[1] = CN high byte,  data[2] = CN low byte
+ * Wiegand parity is handled by the firmware's protocol encoder/decoder.
  */
 static bool hid_h10301_extract(
     const uint8_t* data,
@@ -282,18 +284,14 @@ static bool hid_h10301_extract(
     uint8_t* fc_out,
     uint16_t* cn_out) {
     if(data_size < 3) return false;
-
-    /* Reassemble 26 bits from 3 bytes (MSB first, bits 7..1 of byte 0 = P+FC[7:1]) */
-    uint32_t raw = ((uint32_t)data[0] << 16) | ((uint32_t)data[1] << 8) | data[2];
-
-    /* Bits 25..0: [25]=even parity, [24..17]=FC, [16..1]=CN, [0]=odd parity */
-    *fc_out = (raw >> 17) & 0xFF;
-    *cn_out = (raw >> 1) & 0xFFFF;
+    *fc_out = data[0];
+    *cn_out = ((uint16_t)data[1] << 8) | data[2];
     return true;
 }
 
 /**
- * Encode HID H10301 26-bit data with new FC and CN, recalculating parity.
+ * Encode HID H10301 data with new FC and CN.
+ * Wiegand parity is recalculated by the firmware when writing to T5577.
  */
 static bool hid_h10301_encode(
     uint8_t* data,
@@ -301,34 +299,17 @@ static bool hid_h10301_encode(
     uint8_t fc,
     uint16_t cn) {
     if(data_size < 3) return false;
-
-    uint32_t raw = 0;
-    raw |= ((uint32_t)fc << 17);
-    raw |= ((uint32_t)cn << 1);
-
-    /* Even parity over bits 25..14 (high 12 data bits) */
-    uint8_t even_parity = 0;
-    for(int i = 25; i >= 14; i--) {
-        even_parity ^= (raw >> i) & 1;
-    }
-    if(even_parity) raw |= (1 << 25); /* bit 25 = even parity bit */
-
-    /* Odd parity over bits 12..1 (low 12 data bits) */
-    uint8_t odd_parity = 1;
-    for(int i = 12; i >= 1; i--) {
-        odd_parity ^= (raw >> i) & 1;
-    }
-    if(odd_parity) raw |= 1; /* bit 0 = odd parity bit */
-
-    data[0] = (raw >> 16) & 0xFF;
-    data[1] = (raw >> 8) & 0xFF;
-    data[2] = raw & 0xFF;
+    data[0] = fc;
+    data[1] = (cn >> 8) & 0xFF;
+    data[2] = cn & 0xFF;
     return true;
 }
 
 /**
- * Extract facility code (version byte) and ID from EM4100 data.
- * Data layout: 5 bytes = [FC/version][ID3][ID2][ID1][ID0]
+ * Extract facility code and card number from EM4100 data.
+ * Flipper firmware stores EM4100 as 5 bytes of the 40-bit ID.
+ * The firmware's render_data shows:  FC = data[2],  CN = data[3..4]
+ * data[0..1] are upper ID bytes (preserved, not displayed as FC).
  */
 static bool em4100_extract(
     const uint8_t* data,
@@ -337,14 +318,14 @@ static bool em4100_extract(
     uint16_t* cn_out) {
     if(data_size < 5) return false;
 
-    *fc_out = data[0];
-    /* Use lower 16 bits of the 32-bit ID as card number */
+    *fc_out = data[2];
     *cn_out = ((uint16_t)data[3] << 8) | data[4];
     return true;
 }
 
 /**
- * Encode EM4100 data with new FC, preserving upper ID bytes.
+ * Encode EM4100 data with new FC and CN.
+ * Preserves data[0..1] (upper ID bytes) from the original card.
  */
 static bool em4100_encode(
     uint8_t* data,
@@ -353,10 +334,184 @@ static bool em4100_encode(
     uint16_t cn) {
     if(data_size < 5) return false;
 
-    data[0] = fc;
-    /* Preserve data[1], data[2] (upper ID bytes) unless in fixed/sequential mode */
+    data[2] = fc;
     data[3] = (cn >> 8) & 0xFF;
     data[4] = cn & 0xFF;
+    return true;
+}
+
+/**
+ * Indala26: 4 bytes (28 decoded bits). FC and CN are in scattered bit positions.
+ * Bit map from Flipper firmware protocol_indala26.c get_fc/get_cn.
+ */
+static const uint8_t indala26_fc_bits[8] = {24, 16, 11, 14, 15, 20, 6, 25};
+static const uint8_t indala26_cn_bits[16] = {9, 12, 10, 7, 19, 3, 2, 18, 13, 0, 4, 21, 23, 26, 17, 8};
+
+static bool indala26_extract(const uint8_t* data, size_t data_size, uint8_t* fc_out, uint16_t* cn_out) {
+    if(data_size < 4) return false;
+    uint8_t fc = 0;
+    for(int i = 0; i < 8; i++) fc = (fc << 1) | bit_lib_get_bit(data, indala26_fc_bits[i]);
+    uint16_t cn = 0;
+    for(int i = 0; i < 16; i++) cn = (cn << 1) | bit_lib_get_bit(data, indala26_cn_bits[i]);
+    *fc_out = fc;
+    *cn_out = cn;
+    return true;
+}
+
+static bool indala26_encode(uint8_t* data, size_t data_size, uint8_t fc, uint16_t cn) {
+    if(data_size < 4) return false;
+    /* Write FC bits (MSB first) */
+    for(int i = 0; i < 8; i++)
+        bit_lib_set_bit(data, indala26_fc_bits[i], (fc >> (7 - i)) & 1);
+    /* Write CN bits (MSB first) */
+    for(int i = 0; i < 16; i++)
+        bit_lib_set_bit(data, indala26_cn_bits[i], (cn >> (15 - i)) & 1);
+
+    /* Recalculate parity and checksum (from Flipper firmware render_data) */
+    uint32_t fc_and_card = ((uint32_t)fc << 16) | cn;
+
+    /* Even parity over bits 12..23 of fc_and_card → stored at data bit 1 */
+    uint8_t ep = 0;
+    for(int i = 12; i < 24; i++) ep += (fc_and_card >> i) & 1;
+    bit_lib_set_bit(data, 1, ep % 2);
+
+    /* Odd parity over bits 0..11 of fc_and_card → stored at data bit 5 */
+    uint8_t op = 1;
+    for(int i = 0; i < 12; i++) op += (fc_and_card >> i) & 1;
+    bit_lib_set_bit(data, 5, op % 2);
+
+    /* Indala checksum → stored at data bits 27..28 */
+    uint8_t cs = 0;
+    cs += (fc_and_card >> 14) & 1;
+    cs += (fc_and_card >> 12) & 1;
+    cs += (fc_and_card >> 9) & 1;
+    cs += (fc_and_card >> 8) & 1;
+    cs += (fc_and_card >> 6) & 1;
+    cs += (fc_and_card >> 5) & 1;
+    cs += (fc_and_card >> 2) & 1;
+    cs += (fc_and_card >> 0) & 1;
+    if((cs & 1) == 1) {
+        bit_lib_set_bit(data, 27, 0);
+        bit_lib_set_bit(data, 28, 1);
+    } else {
+        bit_lib_set_bit(data, 27, 1);
+        bit_lib_set_bit(data, 28, 0);
+    }
+    return true;
+}
+
+/**
+ * IoProxXSF: 4 bytes.  FC=data[0], version=data[1], CN=data[2..3].
+ */
+static bool ioprox_extract(const uint8_t* data, size_t data_size, uint8_t* fc_out, uint16_t* cn_out) {
+    if(data_size < 4) return false;
+    *fc_out = data[0];
+    *cn_out = ((uint16_t)data[2] << 8) | data[3];
+    return true;
+}
+
+static bool ioprox_encode(uint8_t* data, size_t data_size, uint8_t fc, uint16_t cn) {
+    if(data_size < 4) return false;
+    data[0] = fc;
+    data[2] = (cn >> 8) & 0xFF;
+    data[3] = cn & 0xFF;
+    return true;
+}
+
+/**
+ * AWID (26-bit format): 9 bytes. data[0]=format(26).
+ * FC at bits 9..16, CN at bits 17..32.
+ * Wiegand parity: even at bit 8, odd at bit 33.
+ */
+static bool awid_extract(const uint8_t* data, size_t data_size, uint8_t* fc_out, uint16_t* cn_out) {
+    if(data_size < 9) return false;
+    if(data[0] != 26) return false; /* Only 26-bit format supported */
+    *fc_out = bit_lib_get_bits(data, 9, 8);
+    *cn_out = bit_lib_get_bits_16(data, 17, 16);
+    return true;
+}
+
+static bool awid_encode(uint8_t* data, size_t data_size, uint8_t fc, uint16_t cn) {
+    if(data_size < 9) return false;
+    if(data[0] != 26) return false;
+    bit_lib_set_bits(data, 9, fc, 8);
+    bit_lib_set_bits(data, 17, (cn >> 8) & 0xFF, 8);
+    bit_lib_set_bits(data, 25, cn & 0xFF, 8);
+    /* Wiegand even parity over FC + high CN (bits 9..20 = 12 bits) */
+    uint8_t ep = 0;
+    for(int i = 9; i <= 20; i++) ep ^= bit_lib_get_bit(data, i);
+    bit_lib_set_bit(data, 8, ep);
+    /* Wiegand odd parity over low CN (bits 21..32 = 12 bits) */
+    uint8_t op = 1;
+    for(int i = 21; i <= 32; i++) op ^= bit_lib_get_bit(data, i);
+    bit_lib_set_bit(data, 33, op);
+    return true;
+}
+
+/**
+ * Pyramid (26-bit format): 4 bytes. data[0]=format(26).
+ * FC at bits 8..15, CN at bits 16..31.
+ */
+static bool pyramid_extract(const uint8_t* data, size_t data_size, uint8_t* fc_out, uint16_t* cn_out) {
+    if(data_size < 4) return false;
+    if(data[0] != 26) return false;
+    *fc_out = bit_lib_get_bits(data, 8, 8);
+    *cn_out = bit_lib_get_bits_16(data, 16, 16);
+    return true;
+}
+
+static bool pyramid_encode(uint8_t* data, size_t data_size, uint8_t fc, uint16_t cn) {
+    if(data_size < 4) return false;
+    if(data[0] != 26) return false;
+    bit_lib_set_bits(data, 8, fc, 8);
+    bit_lib_set_bits(data, 16, (cn >> 8) & 0xFF, 8);
+    bit_lib_set_bits(data, 24, cn & 0xFF, 8);
+    return true;
+}
+
+/**
+ * Paradox: 6 bytes. FC at bits 10..17, CN at bits 18..33, CRC at bits 34..41.
+ * CRC uses bit_lib_crc8 over Manchester-encoded FC+CN.
+ */
+static bool paradox_extract(const uint8_t* data, size_t data_size, uint8_t* fc_out, uint16_t* cn_out) {
+    if(data_size < 6) return false;
+    *fc_out = bit_lib_get_bits(data, 10, 8);
+    *cn_out = bit_lib_get_bits_16(data, 18, 16);
+    return true;
+}
+
+static uint8_t paradox_calc_checksum(uint8_t fc, uint16_t cn) {
+    uint8_t arr[5] = {0, 0, fc, (cn >> 8) & 0xFF, cn & 0xFF};
+    uint8_t manchester[9];
+    memset(manchester, 0, sizeof(manchester));
+
+    /* 4 leading zero bits */
+    bit_lib_push_bit(manchester, 9, false);
+    bit_lib_push_bit(manchester, 9, false);
+    bit_lib_push_bit(manchester, 9, false);
+    bit_lib_push_bit(manchester, 9, false);
+
+    /* Manchester-encode bits 6..39 of arr */
+    for(uint8_t i = 6; i < 40; i++) {
+        if(bit_lib_get_bit(arr, i)) {
+            bit_lib_push_bit(manchester, 9, true);
+            bit_lib_push_bit(manchester, 9, false);
+        } else {
+            bit_lib_push_bit(manchester, 9, false);
+            bit_lib_push_bit(manchester, 9, true);
+        }
+    }
+    return bit_lib_crc8(manchester, 9, 0x31, 0x00, true, true, 0x06);
+}
+
+static bool paradox_encode(uint8_t* data, size_t data_size, uint8_t fc, uint16_t cn) {
+    if(data_size < 6) return false;
+    bit_lib_set_bits(data, 10, fc, 8);
+    bit_lib_set_bits(data, 18, (cn >> 8) & 0xFF, 8);
+    bit_lib_set_bits(data, 26, cn & 0xFF, 8);
+    /* Recalculate and write CRC */
+    uint8_t crc = paradox_calc_checksum(fc, cn);
+    bit_lib_set_bits(data, 34, crc, 8);
     return true;
 }
 
@@ -435,6 +590,16 @@ static void lfrfid_ref_scan_callback(LFRFIDWorkerReadResult result, ProtocolId p
             hid_h10301_extract(data, data_size, &app->ref_fc, &app->ref_cn);
         } else if(strstr(app->ref_proto_name, "EM4100") || strstr(app->ref_proto_name, "EM410")) {
             em4100_extract(data, data_size, &app->ref_fc, &app->ref_cn);
+        } else if(strstr(app->ref_proto_name, "Indala26")) {
+            indala26_extract(data, data_size, &app->ref_fc, &app->ref_cn);
+        } else if(strstr(app->ref_proto_name, "AWID")) {
+            awid_extract(data, data_size, &app->ref_fc, &app->ref_cn);
+        } else if(strstr(app->ref_proto_name, "IoProx")) {
+            ioprox_extract(data, data_size, &app->ref_fc, &app->ref_cn);
+        } else if(strstr(app->ref_proto_name, "Pyramid")) {
+            pyramid_extract(data, data_size, &app->ref_fc, &app->ref_cn);
+        } else if(strstr(app->ref_proto_name, "Paradox")) {
+            paradox_extract(data, data_size, &app->ref_fc, &app->ref_cn);
         } else {
             generic_extract(data, data_size, &app->ref_fc, &app->ref_cn);
         }
@@ -496,13 +661,26 @@ static bool app_process_tag(BulkWriterApp* app) {
     FURI_LOG_I(TAG, "Processing protocol: %s (data_size=%zu)", proto_name, app->last_data_size);
 
     /* Determine encoding type from protocol name */
-    typedef enum { Enc_HID, Enc_EM4100, Enc_Generic } EncType;
+    typedef enum {
+        Enc_HID, Enc_EM4100, Enc_Indala26, Enc_AWID, Enc_IoProx,
+        Enc_Pyramid, Enc_Paradox, Enc_Generic
+    } EncType;
     EncType enc_type = Enc_Generic;
 
     if(strstr(proto_name, "H10301")) {
         enc_type = Enc_HID;
     } else if(strstr(proto_name, "EM4100") || strstr(proto_name, "EM410")) {
         enc_type = Enc_EM4100;
+    } else if(strstr(proto_name, "Indala26")) {
+        enc_type = Enc_Indala26;
+    } else if(strstr(proto_name, "AWID")) {
+        enc_type = Enc_AWID;
+    } else if(strstr(proto_name, "IoProx")) {
+        enc_type = Enc_IoProx;
+    } else if(strstr(proto_name, "Pyramid")) {
+        enc_type = Enc_Pyramid;
+    } else if(strstr(proto_name, "Paradox")) {
+        enc_type = Enc_Paradox;
     }
 
     /* Extract FC/CN using appropriate decoder */
@@ -512,6 +690,21 @@ static bool app_process_tag(BulkWriterApp* app) {
             break;
         case Enc_EM4100:
             extracted = em4100_extract(app->last_data, app->last_data_size, &orig_fc, &orig_cn);
+            break;
+        case Enc_Indala26:
+            extracted = indala26_extract(app->last_data, app->last_data_size, &orig_fc, &orig_cn);
+            break;
+        case Enc_AWID:
+            extracted = awid_extract(app->last_data, app->last_data_size, &orig_fc, &orig_cn);
+            break;
+        case Enc_IoProx:
+            extracted = ioprox_extract(app->last_data, app->last_data_size, &orig_fc, &orig_cn);
+            break;
+        case Enc_Pyramid:
+            extracted = pyramid_extract(app->last_data, app->last_data_size, &orig_fc, &orig_cn);
+            break;
+        case Enc_Paradox:
+            extracted = paradox_extract(app->last_data, app->last_data_size, &orig_fc, &orig_cn);
             break;
         case Enc_Generic:
             extracted = generic_extract(app->last_data, app->last_data_size, &orig_fc, &orig_cn);
@@ -552,6 +745,21 @@ static bool app_process_tag(BulkWriterApp* app) {
             break;
         case Enc_EM4100:
             encoded = em4100_encode(write_data, app->last_data_size, app->facility_code, new_cn);
+            break;
+        case Enc_Indala26:
+            encoded = indala26_encode(write_data, app->last_data_size, app->facility_code, new_cn);
+            break;
+        case Enc_AWID:
+            encoded = awid_encode(write_data, app->last_data_size, app->facility_code, new_cn);
+            break;
+        case Enc_IoProx:
+            encoded = ioprox_encode(write_data, app->last_data_size, app->facility_code, new_cn);
+            break;
+        case Enc_Pyramid:
+            encoded = pyramid_encode(write_data, app->last_data_size, app->facility_code, new_cn);
+            break;
+        case Enc_Paradox:
+            encoded = paradox_encode(write_data, app->last_data_size, app->facility_code, new_cn);
             break;
         case Enc_Generic:
             encoded = generic_encode(write_data, app->last_data_size, app->facility_code, new_cn);
@@ -1134,7 +1342,8 @@ int32_t bulk_writer_app(void* p) {
                             app->lf_worker, read_type,
                             lfrfid_read_callback, app);
                     }
-                } else {
+                } else if(app->current_screen == Screen_Ready ||
+                          app->current_screen == Screen_Reading) {
                     /* Tag was read during bulk processing ΓÇö process it */
                     lfrfid_worker_stop(app->lf_worker);
                     app->current_screen = Screen_Writing;
