@@ -1,31 +1,23 @@
 # Build artifacts
-*.o
-*.elf
-*.bin
-*.hex
-*.map
-*.lst
-
-# Compiled FAP
+dist/
 *.fap
 
-# uFBT build directories
-.ufbt/
-build/
-.vscode/compile_commands.json
-
-# macOS
-.DS_Store
-
-# Windows
-Thumbs.db
-
-# Editors
+# IDE/Editor files
+.vscode/
+.idea/
 *.swp
 *.swo
 *~
-.vscode/
 
-# IDE
-.idea/
-*.sublime-*
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Python cache (if any build scripts)
+__pycache__/
+*.pyc

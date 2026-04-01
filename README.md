@@ -22,15 +22,18 @@ Bulk-program T5577 125kHz cards with a preset facility code. Designed for hands-
 **Note:** Factory HID ProxII and genuine EM4100 cards are read-only. This app only works with T5577-based rewritable cards.
 ## Installation
 
-### Option 1: Flipper App Store (Recommended)
-Install directly from the Flipper mobile app or [Flipper Lab](https://lab.flipper.net/apps) — search for "Bulk Writer" in the RFID category.
+### Method 1: Flipper App Store (Recommended)
+1. Open the Flipper Mobile App
+2. Go to **Hub** → **Apps**
+3. Search for "Bulk Writer"
+4. Tap **Install**
 
-### Option 2: Pre-built FAP Download
-1. Download `bulk_writer.fap` from the [dist/](dist/) folder or [Releases](https://github.com/b0bby225/BulkWriter/releases)
-2. Copy to your Flipper Zero SD card: `SD Card/apps/RFID/bulk_writer.fap`
-3. Launch from **Apps → RFID → Bulk Writer**
+### Method 2: Pre-built FAP Download
+1. Download `bulk_writer.fap` from the [dist/](dist/) folder
+2. Copy to your SD card: `SD Card/apps/RFID/bulk_writer.fap`
+3. Refresh apps on your Flipper (Applications → Browser → Search)
 
-### Option 3: Build from Source
+### Method 3: Build from Source
 ```bash
 # Install ufbt if you haven't already
 pip install ufbt
@@ -39,17 +42,10 @@ pip install ufbt
 git clone https://github.com/b0bby225/BulkWriter.git
 cd BulkWriter
 ufbt
-
-# The compiled .fap will be in dist/bulk_writer.fap
 ```
 
-## Usage
+The compiled `.fap` will be in `dist/bulk_writer.fap`.
 
-1. **Setup** — Configure facility code (0-255), card number mode, and optionally scan a reference card for faster reads
-2. **Start** — Press OK to begin bulk processing  
-3. **Scan** — Place T5577 cards on the reader one at a time
-4. **Listen** — Ascending beep = success, descending buzz = failure
-5. **Stop** — Press Back to view session summary
 ## Controls
 
 | Screen | Controls |
@@ -58,12 +54,6 @@ ufbt
 | **Processing** | Left/Back = Stop |
 | **Summary** | OK/Back = New batch |
 
-## Requirements
-
-- T5577-based writable cards (factory HID ProxII and EM4100 cards are read-only)
-- Flipper Zero with RFID capability
-- Target 7+ firmware (built with ufbt)
-
 ## License
 
 MIT License — see [LICENSE](LICENSE) for details.
@@ -71,13 +61,3 @@ MIT License — see [LICENSE](LICENSE) for details.
 ## Author
 
 Bobby Gibbs ([@b0bby225](https://github.com/b0bby225))
-
----
-
-### Technical Details
-
-**Architecture:** ViewPort-based GUI with persistent FlipperFormat settings. State machine: Config → RefScan → Ready → Reading → Writing → Success/Error (auto-resume).
-
-**Modulation Detection:** ASK (most 125kHz cards), PSK (Indala/AWID), or Auto-detect. Reference scan locks modulation for faster bulk reads.
-
-**Protocol Support:** HID H10301 26-bit with parity recalculation, EM4100 with FC byte substitution.
