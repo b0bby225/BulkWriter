@@ -1,6 +1,6 @@
-# Build artifacts
-dist/
-*.fap
+# Build artifacts - allow FAP files but exclude debug builds
+dist/debug/
+!dist/*.fap
 
 # IDE/Editor files
 .vscode/
