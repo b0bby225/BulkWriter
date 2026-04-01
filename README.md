@@ -4,7 +4,7 @@ Bulk-program RFID cards with preset facility codes. Designed for hands-free batc
 
 **Available Versions:**
 - **v1.0 (this version)** — 125kHz LF RFID only (HID H10301, EM4100, Indala, AWID) 
-- **🚀 v2.0** — Multi-protocol support: LF (125kHz) + NFC (13.56MHz) *(coming soon)*
+- **🚀 v2.0** — Enhanced version with advanced UI, statistics tracking, and improved workflow
 
 ## ✨ Features
 
@@ -29,9 +29,14 @@ Bulk-program RFID cards with preset facility codes. Designed for hands-free batc
 
 ## 🚀 Installation
 
-### Method 1: Pre-built FAP Download
-1. Download `bulk_writer.fap` from the [dist/](dist/) folder
-2. Copy to your SD card: `SD Card/apps/RFID/bulk_writer.fap`
+### Quick Download (Recommended)
+**Choose your version:**
+- **🔥 V1 Stable (Recommended)**: [bulk_writer.fap](dist/bulk_writer.fap) - Production ready LF RFID support
+- **✨ V2 Enhanced**: [bulk_writer_v2.fap](dist/bulk_writer_v2.fap) - Advanced UI with statistics and enhanced features
+
+### Installation Steps
+1. Download the `.fap` file for your preferred version
+2. Copy to your SD card: `SD Card/apps/RFID/bulk_writer.fap` 
 3. Refresh apps on your Flipper (Applications → Browser → Search)
 
 ### Method 2: Build from Source

@@ -1,39 +1,42 @@
-# Bulk Writer V2 — Multi-Protocol RFID Tag Reprogrammer
+# Bulk Writer V2 — Enhanced RFID Tag Reprogrammer
 
-**🚧 DEVELOPMENT VERSION** - Enhanced multi-protocol support for future expansion
+**✨ ENHANCED VERSION** - Advanced UI and improved user experience 
 
-Enhanced version of BulkWriter with architecture for multi-protocol RFID support. Currently implements all LF protocols with foundation for future NFC expansion.
+Enhanced version of BulkWriter with improved interface, statistics tracking, and streamlined workflow. Same powerful LF protocol support with a better user experience.
 
 ## ✨ V2 Enhancements
 
-- **🏗️ Multi-Protocol Architecture** - Foundation ready for LF + NFC support  
-- **🔄 Unified Modulation Field** - Single field handles protocol and modulation selection
-- **⚡ Optimized Performance** - Enhanced detection and processing
-- **📡 Future NFC Ready** - Architecture prepared for 13.56MHz support when APIs are available
-- **🎯 Streamlined UI** - Clean 3-field setup: FC, Card Number Mode, Modulation
+- **📊 Advanced Statistics** - Session tracking, lifetime counters, and protocol-specific stats
+- **🎨 Enhanced UI** - Cleaner design with better visual feedback and progress indicators  
+- **⚡ Improved Workflow** - Streamlined navigation and auto-transitions between screens
+- **🎯 Smart Detection** - Better protocol detection and error handling with retry logic
+- **📈 Success Tracking** - Real-time success rates and detailed session summaries
+- **💾 Persistent Stats** - Lifetime statistics saved across sessions
 
 ## 🔧 Current Protocol Support
 
 ### LF RFID (125kHz) - Fully Implemented
 | Protocol | Format | Writable Cards | Modulation | Status |
 |---|---|---|---|---|
-| **HID H10301** | 26-bit (8-bit FC + 16-bit CN) | T5577 blanks | ASK | ✅ Working |
-| **EM4100** | 40-bit (8-bit FC + 32-bit ID) | T5577 blanks | ASK | ✅ Working |
-| **Indala** | 64-bit | T5577 blanks | PSK | ✅ Working |
-| **AWID** | 50-bit | T5577 blanks | PSK | ✅ Working |
+| **HID H10301** | 26-bit (8-bit FC + 16-bit CN) | T5577 blanks | ASK | ✅ Enhanced |
+| **EM4100** | 40-bit (8-bit FC + 32-bit ID) | T5577 blanks | ASK | ✅ Enhanced |
+| **Indala** | 64-bit | T5577 blanks | PSK | ✅ Enhanced |
+| **AWID** | 50-bit | T5577 blanks | PSK | ✅ Enhanced |
 
-### NFC/HF (13.56MHz) - Planned
-| Protocol | Format | Status | Notes |
-|---|---|---|---|
-| **NTAG213/215/216** | User memory area | 🔜 Planned | Awaiting NFC API availability |
-| **Mifare Classic 1K/4K** | Sector data | 🔜 Planned | Awaiting NFC API availability |
+## 🎮 V2 Enhanced Features
 
-## 🎮 V2 Modulation Options
+- **Statistics Screen** — Detailed session and lifetime statistics with protocol breakdown
+- **Auto (Smart)** — Enhanced auto-detection with better protocol identification
+- **ASK (Fast)** — Optimized for HID H10301 and EM4100 protocols
+- **PSK (Indala)** — Optimized for Indala and AWID protocols
 
-- **Auto (LF)** — Auto-detect LF protocols (ASK+PSK)
-- **ASK (125k)** — LF ASK only (HID H10301, EM4100)  
-- **PSK (125k)** — LF PSK only (Indala, AWID)
-- **NFC (Future)** — 13.56MHz NFC/HF (when available)
+## ✨ Enhanced User Experience
+
+- **Real-time Progress** — Live session counters and success rate tracking
+- **Smart Transitions** — Automatic screen transitions with optimal timing
+- **Enhanced Feedback** — Better visual and audio feedback for all operations
+- **Error Recovery** — Improved retry logic with detailed error messages
+- **Session Summary** — Comprehensive statistics with success rate analysis
 
 ## 🚀 Installation
 
